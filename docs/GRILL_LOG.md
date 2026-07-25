@@ -29,7 +29,8 @@ re-run a real `grillme` pass later against the same document.
 | 2 | 2 lenses on the finished `PLAN.md`, plus a scripted self-audit | 50 | 50 | 0 | closed |
 | 3 | Regression check on the patched plan | 10 | 10 | 0 | closed |
 | 4 | Convergence check | 7 | 7 | 0 | closed |
-| 5 | Convergence re-check | _in progress_ | | | |
+| 5 | Convergence re-check | 5 | 5 | 0 | closed |
+| 6 | Convergence re-check | _in progress_ | | | |
 
 ---
 
@@ -418,3 +419,54 @@ computable predicate.
 local edits rather than structural rework — but four rounds in, each patch is still
 producing a smaller crop of seam defects, which is the argument for one more pass rather
 than stopping here.
+
+
+---
+
+## Round 5 — convergence re-check
+
+Five blocking findings, verdict **NOT CONVERGED** again. The reviewer explicitly cleared
+three of the round-4 fixes (attribute ownership, the stage graph's acyclicity, and
+`sanitize_colon` agreement in both settings), which is useful signal: those patches held.
+The five that did not:
+
+1. **"Significant transition" compared three incommensurable scales.** The definition
+   added in round 4 ranked boundaries by §8.4's `change_floor_percentile` — a percentile
+   over *whole-frame* inter-frame distances — while boundaries are actually created by
+   either a *per-tile* MAD (screen content) or a *pHash Hamming distance* (camera
+   footage). Comparing Hamming bits to a MAD distribution is meaningless; comparing one
+   tile's score to a whole-frame distribution fails in both directions at once. The two
+   readings differ by ~20× in export count. Now ranked against other boundaries using
+   the score the boundary's own detector produced.
+
+2. **`G6` still carried a "transcript span" term** — the exact metric `SC2` was rewritten
+   to reject. Any video with more than a second of non-speech at the head or tail (music
+   intro, title card, silent outro) would fail it *while the union clause read 100%*.
+   Deleted; `G6` now mirrors `SC2` literally — same set, same 99%, same 2 s gap rule.
+
+3. **`Claim.visual_backup` was required at a point where no screenshot id can exist.**
+   Personas emit in `S12`; screenshots are named in `S13`, and §3.3c fixes the filename
+   width from a final count that itself depends on which claims are `needs_visual`. So
+   the id was not merely unknown at emission — it was undetermined. Validation would have
+   dropped every style claim on talking-head and music-inspiration content, deleting
+   R4.7's only mechanism while `G14` passed vacuously over an empty set. Personas now
+   emit `needs_visual` + `backing_state`; `S13` backfills `visual_backup` after freezing
+   the export set.
+
+4. **Two sections disagreed on what `frames.parquet` contains** — §4.2 said the dense
+   scan produces it, §5.4 said the descriptor series is "never stored". Segmentation
+   needs the full series; the merge key needs a persisted descriptor. Resolved by
+   **fusing the scan and segmentation into one stage**, which removes the artifact
+   ambiguity rather than papering over it: descriptors live in a rolling buffer, a
+   compact ~140-byte-per-frame feature table persists for resume, and only *states* keep
+   a full descriptor (~2 MB per video). `VisualState.descriptor` now has exactly one
+   writer.
+
+5. **Round 4 added a third decode site without adding it to the rotation rule.** §5.2 is
+   written per decode site precisely because PyAV and the ffmpeg CLI disagree about the
+   display matrix. The new framing-frame extraction was given a positive instruction to
+   apply rotation while going through the CLI, which autorotates — so it would rotate
+   twice, on the only frames `A1` and `A2` ever see, with `SC6` sampling representatives
+   rather than framing frames and therefore unable to catch it.
+
+**Trend:** 126 → 46 → 10 → 7 → 5.

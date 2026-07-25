@@ -454,14 +454,13 @@ it mid-run.
 | `S1_PROBE` | Container/stream interrogation, **plus 5 evenly-spaced framing frames** (rotation applied per `probe.rotation`, ≤1024 px, written to `framing_frames/`) | video file | `probe.json`, `framing_frames/*.jpg` | — |
 | `S9a_FRAMING` | Personas A1, A2 — provenance and category. **Runs early**: `S6` needs `A2.multi_speaker` to decide whether to diarize (§6.5) | `probe.json`, `framing_frames/*.jpg` | `personas/A*.json` | S2, S3 |
 | `S2_AUDIO_EXTRACT` | Extract ASR WAV (16 kHz mono) + analysis WAV (48 kHz stereo) | `probe.json` | `asr.wav`, `analysis.wav` | S3 |
-| `S3_VISUAL_SCAN` | **Single dense decode**: per-frame PTS + downscaled descriptor + activity envelope | `probe.json` | `frames.parquet`, `activity.npy` | S2 |
-| `S4_STATES` | Segment the visual track into half-open state intervals | `frames.parquet` | `visual_states.json` | — |
+| `S3_VISUAL_SCAN` | **Single dense decode**, segmentation included: per-frame PTS, per-tile features, activity envelope, **and** the state partition | `probe.json` | `frames.parquet`, `activity.npy`, `visual_states.json` | S2 |
 | `S5_TRANSCRIBE` | ASR + forced alignment → word-level timestamps | `asr.wav` | `transcript.json` | — |
 | `S6_DIARIZE` | Speaker turns (optional, §6.5) | `asr.wav`, `A2.multi_speaker` | `speakers.json` | — |
 | `S7_AUDIO_FEATURES` | Silence, music, tempo/key, sound events | `analysis.wav` | `audio_features.json` | — |
 | `S8_REPRESENTATIVES` | Choose representative frames; extract JPEGs; OCR them | `visual_states.json` | `representatives.json`, frame JPEGs | — |
 | `S9b_NAMING` | Folder name (§3.3a) | `probe.json`, A1, A2 | `naming.json` | — |
-| `S10_ALIGN` | Bind words → states; clauses → states; steps → screenshots | S4, S5, S6, **S7**, S8 | `alignment.json` | — |
+| `S10_ALIGN` | Bind words → states; clauses → states; steps → screenshots | S3, S5, S6, **S7**, S8 | `alignment.json` | — |
 | `S11_VERIFY_SYNC` | The sync proofs of §5.6 — **gate** | S10, **S7**, **S3**'s `activity.npy` | `sync_report.json` | — |
 | `S12_PERSONAS` | Passes B, C, D of the roster (§9.2) | everything above | `personas/*.json` | internally parallel |
 | `S13_ASSEMBLE` | Render Markdown + JSON sidecar + export screenshots | all | `.md`, `.json`, `screenshots/` | — |
@@ -481,6 +480,22 @@ intervals (§5.6) — all of which live in `audio_features.json`. Omitting that 
 merely untidy: §4.4 skips a stage when its recorded `input_hash` still matches, so
 changing `audio.min_silence_seconds` would re-run `S7` and leave `S10` cached, shipping
 clause and step boundaries computed under the old threshold with no diagnostic.
+
+**Why `S3` and segmentation are one stage.** Segmentation needs the full per-frame
+descriptor series, but keeping 4 KB per frame for a 90-minute video is ~650 MB, which
+this plan declines to store (§5.4). Splitting them would force either that 650 MB onto
+disk or a second decode. Fused, the descriptors stay in a rolling buffer and only two
+things are persisted:
+
+- `frames.parquet` — one compact row per frame: PTS, 16 per-tile MADs, 16 per-tile mean
+  luminances (~140 bytes/frame; ~23 MB for a 90-minute video). Enough to re-derive
+  boundaries, fades and dissolves on resume without decoding again.
+- `visual_states.json` — the partition, each state carrying the **full 4 KB descriptor
+  of its representative frame** (§4.3). Only states keep descriptors — a few hundred per
+  video, ~2 MB — and that is the field `S8`'s merge keys on (§13.1).
+
+So `VisualState.descriptor` has exactly one writer, `S3`, and the full per-frame series
+is genuinely never stored.
 
 **Dependency note:** `S3` must not depend on `S5`. An earlier draft made frame
 extraction depend on the transcript while also declaring the two parallel — an
@@ -522,6 +537,16 @@ class VisualState(BaseModel):
     ocr_text: str | None
     ocr_boxes: list[OCRBox] = []
 
+# Why `visual_backup` is not a persona output: personas run in S12, but screenshots are
+# selected, named and exported in S13, and §3.3c fixes the NN filename width from the
+# final count — which itself depends on which claims are needs_visual. The id therefore
+# does not merely happen to be unknown at emission time, it is not yet determined.
+# Requiring it on the emission-time model would fail §9.6 validation, exhaust the two
+# retries, and DROP every style claim on a talking-head or music-inspiration video —
+# silently deleting R4.7's only mechanism while G14 passed over an empty set.
+# S13 is the single owner: it freezes the export set, chooses the width, then backfills
+# visual_backup. G14 validates after that, never before.
+
 class Step(BaseModel):                # the assembler's contract for §10.4
     step_id: str                      # assigned by S10 only
     span: TimeSpan
@@ -545,8 +570,13 @@ class Claim(BaseModel):
     timestamp: str                  # "HH:MM:SS.mmm" — see §9.6
     evidence: list[str]             # e.g. ["word:1043-1051", "state:17", "ocr:state17#3"]
     confidence: float
-    visual_backup: str | None       # screenshot id; REQUIRED when needs_visual is True
-    needs_visual: bool = False      # set for any claim asserting on-screen appearance
+    needs_visual: bool = False      # set by the persona for any claim asserting
+                                    # on-screen appearance
+    backing_state: int | None       # the visual state the persona points at.
+                                    # Personas emit THIS, never a screenshot id.
+    visual_backup: str | None       # screenshot id, filled in by S13 after the export
+                                    # set is frozen. Always None at persona-emission
+                                    # time — see the note below.
 ```
 
 ### 4.4 Resume, caching, and the stage ledger
@@ -618,8 +648,16 @@ Robustness rules, each of which fixes a crash the draft would have hit:
   series transposed relative to the exported screenshots**, breaking `SC6` on two of
   the five mandatory archetypes with no diagnosis.
   **Rule:** read `side_data_list[].rotation` at probe time into `probe.rotation`. In
-  `S3`, apply that rotation explicitly to each decoded frame before computing the
-  descriptor. In `S8`, apply nothing — the CLI has already done it. Assert that the
+  `S3`, which decodes with PyAV, apply that rotation explicitly to each decoded frame
+  before computing the descriptor. In `S1` (framing frames) and `S8` (representative
+  export), both of which go through the ffmpeg CLI, **apply nothing** — the CLI has
+  already done it, and applying it again rotates twice.
+  Every decode site in the pipeline appears in that list; adding a new one without
+  adding it here is a defect. The framing frames matter disproportionately because they
+  are the *only* frames `A1` and `A2` ever see, and `SC6` samples representatives rather
+  than framing frames, so a double rotation there would silently degrade provenance,
+  category and the R7 folder name with nothing to catch it. Assert that each framing
+  frame's aspect ratio matches the probed display aspect. Assert that the
   exported frame's dimensions match the descriptor's orientation.
   The draft's `-vf "rotate=90"` was wrong three times over regardless: that filter takes
   **radians** (90 rad ≈ 5157°), it does not resize the canvas so content is cropped
@@ -666,7 +704,7 @@ def to_master(t_local: float, stream: Literal["audio", "video"]) -> float: ...
   fault of the pipeline. If AAC must be used, assert against the container's actual
   first-packet PTS with a tolerance of one audio frame. This test is mandatory (§15).
 
-### 5.4 The single dense visual pass (`S3_VISUAL_SCAN`)
+### 5.4 The single dense visual pass (`S3_VISUAL_SCAN`, part 1: decode)
 
 This replaces three separate decode passes and removes a whole class of timing bugs.
 
@@ -690,8 +728,9 @@ MUST be a timestamp-carrying container — `-f nut -` or `-f matroska -` — nev
 
 For every frame record:
 PTS (master time), a 64×64 grayscale descriptor, and the mean absolute difference from
-the previous frame. 64×64 gray is 4 KB per frame — a 90-minute 30 fps video is ~650 MB
-streamed, never stored; write only the derived table.
+the previous frame. 64×64 gray is 4 KB per frame — a 90-minute 30 fps video is ~650 MB streamed through a
+rolling buffer and never written. What persists is the compact per-frame feature table
+plus one descriptor per *state* (§4.2), not per frame.
 
 Why this matters:
 
@@ -707,7 +746,7 @@ Why this matters:
 - `-hwaccel videotoolbox` uses the M1's hardware decoder. Without it, decode alone on a
   2-hour 4K file is hours (§13.2).
 
-### 5.5 Visual states as a partition (`S4_STATES`)
+### 5.5 Visual states as a partition (`S3_VISUAL_SCAN`, part 2: segmentation)
 
 Visual states are **half-open intervals `[t_i, t_{i+1})` that partition the timeline**.
 Not a list of sampled instants. This one modelling choice removes an entire family of
@@ -1318,7 +1357,7 @@ required-section set is a table keyed on the §9.1 category enum:
 | Meeting main points | `multi_speaker` **and** category ∈ {`video_conference`, `screen_share_tutorial`} |
 | Steps | a non-empty step manifest exists |
 | Explained topics | `B2` emitted at least one `explanation_span` (§10.5) |
-| Visual walkthrough | at least one **significant transition** (defined in §10.6) falls outside every step — hosts those screenshots with their descriptions |
+| Visual walkthrough | at least one **significant transition** (defined in §10.6) falls outside every step, **or** any `needs_visual` claim forced an export (§10.6) — hosts those screenshots with their descriptions |
 | Look, style and mood | `category ∈ {music_inspiration, mixed}` **or** `has_music` |
 | Music and sound | `has_music` |
 | Tools and materials | `has_physical_tools` **or** any tool claim exists |
@@ -1457,14 +1496,22 @@ which actively pushes a dense 14-step UI walkthrough to drop half its steps.
 blocking and `G3`/`G5` and §15.3's determinism criterion all depend on the resulting
 export set. A state boundary is significant when **both** hold:
 
-- its descriptor delta is at or above the file's `change_floor_percentile` distance
-  (§8.4) — i.e. it is in the top 5% of changes for this video, not merely above the
-  segmentation floor; **and**
+- the boundary ranks in the top `walkthrough_top_boundary_fraction` (default 0.05) of
+  **state boundaries in this file**, scored by *the same detector that created it* —
+  per-tile MAD for screen content, pHash Hamming distance for camera footage (§5.5);
+  **and**
 - the state it opens lasts at least `walkthrough_min_state_seconds` (default 3.0).
 
-Without the first clause, reusing §5.5's `block_delta_floor` would qualify *every*
-non-step boundary and export up to 300 screenshots; the two readings differ by two
-orders of magnitude, which is why the threshold is named rather than implied.
+**Rank boundaries against boundaries, using one detector's own scale.** Do **not** reuse
+§8.4's `change_floor_percentile`: that is a percentile over *whole-frame* inter-frame
+distances computed per word, and it is not commensurable with either segmentation score.
+Comparing a pHash Hamming distance (0–64 bits) to a MAD distribution (0–255) is
+meaningless; comparing a single tile's MAD to a whole-frame MAD fails in both directions
+— one tile changing hard scores ~1.25 whole-frame and is silently discarded, while on a
+mostly-static recording the 95th percentile of whole-frame MADs sits in the codec-noise
+floor and *every* boundary qualifies. Those two readings differ by roughly 20×, and the
+resulting export set feeds `G1`, `G3`, `G5`, §13.5's cost model and §15.3's determinism
+criterion.
 
 **Screenshots at significant transitions that fall outside any step** are exported only
 when §10.1's *Visual walkthrough* section is emitted, and they live there.
@@ -1553,7 +1600,7 @@ and the template hardcoded `qa_passed: true`.
 | G3 | Every exported screenshot is referenced ≥ 1 time (no orphans) | blocking |
 | G4 | No two screenshots are byte-identical; perceptual near-duplicates flagged | warning |
 | G5 | Every image has alt text ≥ 60 chars, non-generic, plus a "What you see on screen" block ≥ 40 words | blocking |
-| G6 | *(only when `has_speech`)* transcript span vs `ffprobe` duration within 1.0 s, **and** `union(transcribed ∪ silence ∪ music ∪ non-speech)` ≥ 98% of the audio span | blocking |
+| G6 | *(only when `has_speech`)* `union(transcribed ∪ silence ∪ music ∪ non-speech)` ≥ 99% of the audio span, with no unexplained gap > 2 s | blocking |
 | G7 | Every narrator quote is a byte-exact substring of the transcript after whitespace normalisation | blocking |
 | G8 | Every step has the required fields **for its content class** (table below), non-empty, `Action` starting with a controlled verb (§14.4) | blocking |
 | G9 | Every claim's evidence reference resolves (§9.8) | blocking |
@@ -1567,8 +1614,16 @@ G6 must be measured against `ffprobe` and VAD output, not against the document's
 front matter — the draft compared the transcript to a duration the same pipeline wrote,
 so a run that truncated both passed.
 
-**G6 does not apply to silent or music-only videos.** It mirrors `SC2`'s explained-
-coverage set exactly. Without that carve-out, an AI-generated silent clip (R1.3.d) has
+**G6 has no "transcript span" term.** An earlier version compared the span from first to
+last word against the container duration, which fails on any video with more than a
+second of non-speech at the head or tail — a music intro, a title card, a silent outro,
+closing b-roll. That is the common case, and it would have fired *while the union clause
+was fully satisfied*, quarantining the run over speech that was never spoken. Truncation
+is already caught by the union clause: a transcript short by 30 s leaves a 30-second
+unexplained gap. G6 now mirrors `SC2` exactly — same set, same 99% threshold, same 2 s
+gap rule — which is what "mirrors" was always meant to mean.
+
+**G6 does not apply to silent or music-only videos.** Without that carve-out, an AI-generated silent clip (R1.3.d) has
 no transcript span at all and a music-led Instagram clip (R1.3.a) has near-zero speech
 *and* near-zero silence — both would quarantine, and the tool would never produce output
 for two of its five mandatory archetypes.
@@ -1893,6 +1948,8 @@ sync:
 vision:
   vision_frame_cap: 300
   walkthrough_min_state_seconds: 3.0
+  walkthrough_top_boundary_fraction: 0.05   # of state boundaries, scored by the
+                                            # detector that created them (§10.6)
   max_image_long_edge_px: 1024
   screenshot_long_edge_px: 2560
 
@@ -1998,7 +2055,7 @@ The build is done when:
 | M | Milestone | Done when |
 |---|---|---|
 | M1 | Skeleton: CLI, config, workspace, cache, stage ledger | `--dry-run` works on a real file |
-| M2 | `S1`–`S4`: probe, dense scan, states | State list partitions the timeline on all fixtures |
+| M2 | `S1`–`S3`: probe, dense scan, states | State list partitions the timeline on all fixtures |
 | M3 | `S5`–`S7`: transcript, alignment, audio features | Word timestamps verified; `SC4` passes |
 | M4 | `S8`, `S10`, `S11`: representatives, alignment, **sync proofs** | **`SC1`–`SC6` pass. Do not proceed until they do.** |
 | M5 | `S9a`, `S9b`, `S12`: personas, prompts, grounding, evidence resolution | Every prompt file exists; `G9` passes |
