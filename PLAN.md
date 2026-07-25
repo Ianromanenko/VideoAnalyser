@@ -344,9 +344,14 @@ mapping to the human phrase, and it MUST be reproduced verbatim in code:
 and the override is used verbatim after the `original: ` prefix.
 
 **Sanitisation applies to Part 1 only.** The ` | ` separators and the literal
-`original: ` prefix are structural and are NEVER sanitised — sanitising them is what
-would destroy the format R7 requires. Sanitise the free-text tail of Part 3 for path
-separators only.
+`original: ` prefix are structural and are never sanitised by the Part-1 rules —
+sanitising them is what would destroy the format R7 requires. Sanitise the free-text
+tail of Part 3 for path separators only.
+
+**One exemption:** the `original:` colon is rewritten to ` - ` if and only if
+`sanitize_colon` is set (§3.3). That flag is the single switch; the namer and gate
+`G12` MUST read the same config key, or a supported configuration writes one form while
+the gate demands the other and every run quarantines.
 
 **Re-running on the same video on the same day** resolves to the same folder name.
 Policy: with `--reprocess`, the folder is emptied before writing, so no screenshot
@@ -446,8 +451,8 @@ it mid-run.
 
 | ID | Stage | Consumes | Produces | Parallel with |
 |---|---|---|---|---|
-| `S1_PROBE` | Container/stream interrogation | video file | `probe.json` | — |
-| `S9a_FRAMING` | Personas A1, A2 — provenance and category. **Runs early**: `S6` needs `A2.multi_speaker` to decide whether to diarize (§6.5) | `probe.json`, a few frames | `personas/A*.json` | S2, S3 |
+| `S1_PROBE` | Container/stream interrogation, **plus 5 evenly-spaced framing frames** (rotation applied per `probe.rotation`, ≤1024 px, written to `framing_frames/`) | video file | `probe.json`, `framing_frames/*.jpg` | — |
+| `S9a_FRAMING` | Personas A1, A2 — provenance and category. **Runs early**: `S6` needs `A2.multi_speaker` to decide whether to diarize (§6.5) | `probe.json`, `framing_frames/*.jpg` | `personas/A*.json` | S2, S3 |
 | `S2_AUDIO_EXTRACT` | Extract ASR WAV (16 kHz mono) + analysis WAV (48 kHz stereo) | `probe.json` | `asr.wav`, `analysis.wav` | S3 |
 | `S3_VISUAL_SCAN` | **Single dense decode**: per-frame PTS + downscaled descriptor + activity envelope | `probe.json` | `frames.parquet`, `activity.npy` | S2 |
 | `S4_STATES` | Segment the visual track into half-open state intervals | `frames.parquet` | `visual_states.json` | — |
@@ -456,8 +461,8 @@ it mid-run.
 | `S7_AUDIO_FEATURES` | Silence, music, tempo/key, sound events | `analysis.wav` | `audio_features.json` | — |
 | `S8_REPRESENTATIVES` | Choose representative frames; extract JPEGs; OCR them | `visual_states.json` | `representatives.json`, frame JPEGs | — |
 | `S9b_NAMING` | Folder name (§3.3a) | `probe.json`, A1, A2 | `naming.json` | — |
-| `S10_ALIGN` | Bind words → states; clauses → states; steps → screenshots | S4, S5, S6, S8 | `alignment.json` | — |
-| `S11_VERIFY_SYNC` | The sync proofs of §5.6 — **gate** | S10 | `sync_report.json` | — |
+| `S10_ALIGN` | Bind words → states; clauses → states; steps → screenshots | S4, S5, S6, **S7**, S8 | `alignment.json` | — |
+| `S11_VERIFY_SYNC` | The sync proofs of §5.6 — **gate** | S10, **S7**, **S3**'s `activity.npy` | `sync_report.json` | — |
 | `S12_PERSONAS` | Passes B, C, D of the roster (§9.2) | everything above | `personas/*.json` | internally parallel |
 | `S13_ASSEMBLE` | Render Markdown + JSON sidecar + export screenshots | all | `.md`, `.json`, `screenshots/` | — |
 | `S13b_VERIFY_OUT` | Persona `D5` — verifies exported files (§9.4) | `S13` output | `personas/D5.json` | — |
@@ -469,6 +474,13 @@ make `S9 → S12 → S9` a cycle. Likewise `D5` runs as `S13b`, after export, be
 job is to verify files that do not exist until then.
 
 `S11` and `S14` are **gates**: on failure the run does not silently continue (§12.3).
+
+**Why `S7` is an input to both `S10` and `S11`, not just a sibling:** `S10`'s clause
+boundaries use silences ≥ 400 ms (§8.3) and `SC2` unions silence, music and non-speech
+intervals (§5.6) — all of which live in `audio_features.json`. Omitting that edge is not
+merely untidy: §4.4 skips a stage when its recorded `input_hash` still matches, so
+changing `audio.min_silence_seconds` would re-run `S7` and leave `S10` cached, shipping
+clause and step boundaries computed under the old threshold with no diagnostic.
 
 **Dependency note:** `S3` must not depend on `S5`. An earlier draft made frame
 extraction depend on the transcript while also declaring the two parallel — an
@@ -500,6 +512,12 @@ class VisualState(BaseModel):
     index: int
     span: TimeSpan                  # states PARTITION the timeline — no gaps, no overlaps
     representative_pts: float       # ACTUAL decoded PTS, never a requested time
+    descriptor: bytes               # the 64x64 gray descriptor, 4096 bytes. Persisted
+                                    # because S8's merge (§13.1) needs it and S8 is
+                                    # independently resumable — it may start in a fresh
+                                    # process with nothing in memory. ~2 MB for a
+                                    # 90-minute file; cheap insurance against two
+                                    # engineers inventing two different merge keys.
     frame_path: Path | None
     ocr_text: str | None
     ocr_boxes: list[OCRBox] = []
@@ -1070,8 +1088,23 @@ screen_share_tutorial | software_tutorial | workshop_tutorial | talking_head
 | video_conference | music_inspiration | mixed | other
 ```
 
-Plus independent boolean attributes evaluated separately: `has_speech`, `has_music`,
-`has_screen_content`, `has_physical_tools`, `multi_speaker`, `has_timelapse`.
+Plus independent boolean attributes. **These are not all produced by the same stage,
+and that distinction is load-bearing** — three blocking gates read them:
+
+| Attribute | Produced by | How |
+|---|---|---|
+| `has_screen_content` | `A2` (`S9a`) | Frame evidence: UI chrome, text density, straight edges |
+| `has_physical_tools` | `A2` (`S9a`) | Frame evidence |
+| `has_timelapse` | `A2` (`S9a`) | Frame evidence + probe frame rate |
+| `multi_speaker` | `A2` (`S9a`) | Probe + frame evidence only — video tiles, call UI, ≥2 audio tracks. **Never** from `speakers.json`, which does not exist yet (§6.5) |
+| `has_speech` | **`S5`** | Voiced-word fraction ≥ `has_speech_floor` |
+| `has_music` | **`S7`** | Music-segment fraction ≥ `has_music_floor` |
+
+`has_speech` and `has_music` are properties of the *audio* and cannot be inferred from
+`probe.json` and a few video frames — a music-only Instagram clip has an audio stream,
+so a frame-derived guess would read `has_speech: true`, fire `G6`, and quarantine
+exactly the archetype §12.1's carve-out exists to protect. Gates read the `S5`/`S7`
+values, never `A2`'s. Both floors are in §14.3.
 
 **Routing is a table from (category, attributes) → persona set, with an explicit
 default that activates everything.** No category may fall through to an empty set.
@@ -1285,7 +1318,7 @@ required-section set is a table keyed on the §9.1 category enum:
 | Meeting main points | `multi_speaker` **and** category ∈ {`video_conference`, `screen_share_tutorial`} |
 | Steps | a non-empty step manifest exists |
 | Explained topics | `B2` emitted at least one `explanation_span` (§10.5) |
-| Visual walkthrough | any significant state transition falls outside every step — hosts those screenshots with their descriptions |
+| Visual walkthrough | at least one **significant transition** (defined in §10.6) falls outside every step — hosts those screenshots with their descriptions |
 | Look, style and mood | `category ∈ {music_inspiration, mixed}` **or** `has_music` |
 | Music and sound | `has_music` |
 | Tools and materials | `has_physical_tools` **or** any tool claim exists |
@@ -1420,11 +1453,34 @@ Both thresholds live in §14.3.
 floor, not a target. The draft suggested "6–10 screenshots for a 3–5 minute tutorial",
 which actively pushes a dense 14-step UI walkthrough to drop half its steps.
 
-**Screenshots at significant state transitions that fall outside any step** are exported
-only when §10.1's *Visual walkthrough* section is emitted, and they live there. Nothing
-may be exported without a section that references it: `G3` treats an unreferenced file
-as a blocking orphan, and `G5` requires alt text and a "What you see on screen" block
-for *every* image — so an exported frame with no home fails two gates.
+**A "significant transition" is a defined quantity, not a judgement call** — `G1` is
+blocking and `G3`/`G5` and §15.3's determinism criterion all depend on the resulting
+export set. A state boundary is significant when **both** hold:
+
+- its descriptor delta is at or above the file's `change_floor_percentile` distance
+  (§8.4) — i.e. it is in the top 5% of changes for this video, not merely above the
+  segmentation floor; **and**
+- the state it opens lasts at least `walkthrough_min_state_seconds` (default 3.0).
+
+Without the first clause, reusing §5.5's `block_delta_floor` would qualify *every*
+non-step boundary and export up to 300 screenshots; the two readings differ by two
+orders of magnitude, which is why the threshold is named rather than implied.
+
+**Screenshots at significant transitions that fall outside any step** are exported only
+when §10.1's *Visual walkthrough* section is emitted, and they live there.
+
+**A claim that needs visual backing also forces an export.** `G14` is blocking and
+requires every `needs_visual` claim to resolve to an *exported* screenshot — so a rule
+must exist that produces one. It does: such a claim's dominant visual state (§8.2) is
+added to the export set, and emitting one forces the *Visual walkthrough* section on
+even when no transition otherwise qualified. Without this, a talking-head or
+music-inspiration video with no step manifest has style claims that are `needs_visual`
+by definition and nothing to point at — `G14` blocks, the repair rounds cannot mint a
+screenshot, and the run quarantines. This is the mechanism §17 credits for R4.7.
+
+Nothing may be exported without a section that references it: `G3` treats an
+unreferenced file as a blocking orphan, and `G5` requires alt text and a "What you see
+on screen" block for *every* image — so an exported frame with no home fails two gates.
 
 ### 10.7 Alt text carries the content
 
@@ -1571,9 +1627,10 @@ always be smaller than the number of states — silently leaving states undescri
   overlapping everything between them and break `SC3`. Merge the adjacent pair with the
   smallest descriptor distance, repeat until the count fits. A merged state records
   `merged_from: [ids]` and is rendered as one entry; no state is dropped.
-- **Owner:** `S8_REPRESENTATIVES` performs the merge. `frames.parquet` keeps the raw
-  state list; `S10_ALIGN`, §10.3's table, and screenshot export all consume the
-  **merged** list, so there is exactly one notion of "a state" downstream.
+- **Owner:** `S8_REPRESENTATIVES` performs the merge, keyed on the `descriptor` field
+  persisted in `visual_states.json` (§4.3). `visual_states.json` keeps the raw state
+  list; `S10_ALIGN`, §10.3's table, and screenshot export all consume the **merged**
+  list, so there is exactly one notion of "a state" downstream.
 - Coverage therefore remains 100% by construction, and `D3` checks the merged list.
 
 | Work | Model | Rationale |
@@ -1809,6 +1866,8 @@ visual:
   change_floor_minimum: 4.0      # hard floor under the percentile
 
 audio:
+  has_speech_floor: 0.02         # voiced-word fraction of the audio span
+  has_music_floor: 0.30          # music-segment fraction of the audio span
   asr_sample_rate: 16000
   analysis_sample_rate: 48000
   silence_margin_db: 10.0        # threshold = measured noise floor + this
@@ -1833,6 +1892,7 @@ sync:
 
 vision:
   vision_frame_cap: 300
+  walkthrough_min_state_seconds: 3.0
   max_image_long_edge_px: 1024
   screenshot_long_edge_px: 2560
 

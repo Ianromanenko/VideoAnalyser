@@ -28,7 +28,8 @@ re-run a real `grillme` pass later against the same document.
 | 1 | 5 independent lenses on the full draft set | 126 | 126 | 0 | closed |
 | 2 | 2 lenses on the finished `PLAN.md`, plus a scripted self-audit | 50 | 50 | 0 | closed |
 | 3 | Regression check on the patched plan | 10 | 10 | 0 | closed |
-| 4 | Convergence check | _in progress_ | | | |
+| 4 | Convergence check | 7 | 7 | 0 | closed |
+| 5 | Convergence re-check | _in progress_ | | | |
 
 ---
 
@@ -349,3 +350,71 @@ the per-image token ceilings — and found no errors.
 
 **Trend:** 126 findings → 46 → 10. Each round's findings are narrower and more local
 than the last, which is what convergence looks like.
+
+
+---
+
+## Round 4 — convergence check
+
+Scoped to blocking findings only, capped at eight, with an explicit instruction that
+"no blocking issues remain" was an acceptable and valuable answer. It returned **seven**
+and a verdict of **NOT CONVERGED** — so the instruction did not simply license a rubber
+stamp.
+
+The reviewer confirmed the round-3 patch held where it was applied: `§4.2` is acyclic,
+the adjacent-only merge does preserve `SC3`'s partition invariant, `G6` and `SC2` now
+agree on the explained-coverage set, and the cost, threshold and acceptance numbers are
+mutually consistent. But moving `S9a_FRAMING` earlier — the round-3 fix for the
+diarization cycle — created a new ownership defect, and two blocking gates still had no
+computable predicate.
+
+1. **The `S9a` move fixed one attribute and left two behind.** Round 3 correctly ruled
+   that `A2.multi_speaker` must be inferred from probe and frame evidence rather than
+   from `speakers.json`. But `has_speech` and `has_music` are also `A2` attributes, and
+   they are properties of the *audio*, produced by `S5`/`S7` — which now run after
+   `S9a`. A music-only Instagram clip has an audio stream, so a frame-derived
+   `has_speech` reads true, `G6` fires, and the clip quarantines: precisely the failure
+   round 3's `G6` carve-out was written to prevent. Now sourced from `S5`/`S7` with
+   floors in §14.3, and the attribute table states which stage owns each.
+
+2. **"Significant state transition" was never defined**, yet it triggers a conditional
+   section that `G1` blocks on and determines the whole exported-screenshot set. The two
+   natural readings differ by two orders of magnitude — reuse the segmentation floor and
+   every non-step boundary qualifies; reuse the change-detection percentile and almost
+   none do. Now a named threshold pair.
+
+3. **`G14` was a blocking gate with no producer.** It requires every `needs_visual`
+   claim to resolve to an *exported* screenshot, but the export set was closed to steps
+   and walkthrough transitions. A talking-head or music-inspiration video with no step
+   manifest has style claims that are `needs_visual` by definition and nothing to point
+   at. Added the export rule that makes R4.7 real rather than merely asserted in §17.
+
+4. **`S9a`'s "a few frames" had no producer and no rotation rule.** `S3` streams its
+   descriptors and never stores them; `S8` runs much later. Worse, §5.2 establishes that
+   PyAV does not apply the display matrix — so an un-rotated portrait iPhone capture
+   would be judged landscape, `A1` would mis-classify provenance, and §3.3a would bake
+   that error into the R7 folder name and every link in the document. `S1` now produces
+   the framing frames explicitly, rotation applied.
+
+5. **`S10` and `S11` were missing their `S7` edge.** Silence, music and non-speech
+   intervals live in `audio_features.json`, which neither stage listed as an input —
+   making `SC2` uncomputable as specified. The subtler consequence is caching: §4.4
+   skips a stage when its input hash matches, so changing the silence threshold would
+   re-run `S7` and leave `S10` cached, shipping boundaries computed under the old value.
+
+6. **The merge key was data the plan explicitly never persists.** §13.1 merges "the
+   adjacent pair with the smallest descriptor distance", but `VisualState` had no
+   descriptor field and §5.4 says the series is never stored — and `S8` is independently
+   resumable, so it may start with nothing in memory. Two engineers would have invented
+   two different keys and produced different screenshot sets from the same input.
+   `descriptor` is now a persisted field (~2 MB for a 90-minute video).
+
+7. **Two sections disagreed about `sanitize_colon`.** §3.3a said the `original:` prefix
+   is *never* sanitised; §3.3 said the flag rewrites it. Followed literally the namer
+   writes one form while `G12` demands the other — every run under a supported
+   configuration quarantines.
+
+**Trend:** 126 → 46 → 10 → 7. Still converging, and the findings are now uniformly
+local edits rather than structural rework — but four rounds in, each patch is still
+producing a smaller crop of seam defects, which is the argument for one more pass rather
+than stopping here.
