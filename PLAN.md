@@ -87,6 +87,12 @@ binding constraint, not a hint:
   viable but not free.
 - Architecture is `arm64`. Every wheel must be native; anything falling back to
   Rosetta or to an x86_64 build is a defect, not a slowdown.
+- **macOS 14.0 or later is a hard precondition.** `av` 18.0.0 publishes its Apple
+  Silicon wheel as `macosx_14_0_arm64`, and `mlx` likewise. On macOS 11–13 both fall
+  back to building from source — PyAV needs a full FFmpeg dev toolchain and `mlx` has
+  no usable sdist path — so the first run dies in an opaque compiler error. An M1
+  MacBook shipped with macOS 11, so this is a real upgrade requirement, not a formality.
+  `bootstrap.sh` MUST check it (§2.6).
 
 Everything in §13 (memory and cost control) exists because of this section.
 
@@ -182,11 +188,14 @@ The bootstrap MUST check all of these and report every failure at once, rather t
 failing on the first and making the user re-run repeatedly:
 
 1. `ANTHROPIC_API_KEY` present in `.env` or the environment.
-2. Whisper weights present (downloaded on first use; ~1.5 GB for `large-v3`). The
+2. Whisper weights present (downloaded on first use; **~3.1 GB** for `large-v3` — it is 1,550 M parameters at fp16, not 1.5 GB; §13.3 uses the same figure). The
    bootstrap SHOULD pre-fetch so the first real run is not a surprise download.
-3. **`pyannote.audio` diarization models are gated.** The user must have a Hugging
-   Face account, accept the model terms for `pyannote/speaker-diarization-3.1` and
-   `pyannote/segmentation-3.0` on huggingface.co, and provide `HF_TOKEN`. This is a
+3. **`pyannote.audio` diarization models are gated.** With the pinned 4.0.7 the
+   default pipeline is **`pyannote/speaker-diarization-community-1`** — 3.1 is the
+   legacy pipeline, and community-1 is specifically better at speaker counting and
+   assignment, which is the failure mode §6.5 guards against. The user must have a
+   Hugging Face account, accept that one model's conditions, and provide `HF_TOKEN`.
+   (The 4.x pin is forced: `whisperx` 3.8.6 requires `pyannote-audio>=4.0.0`.) This is a
    manual, interactive, browser step that cannot be automated. The bootstrap MUST
    detect a missing/unaccepted token and print the exact URLs to visit. If the user
    declines, diarization degrades to a single unnamed speaker (§6.5) — the run
@@ -268,13 +277,17 @@ implementer must handle deliberately rather than discover:
   substitute — that would violate the literal spec of R7.
 - **Control characters and newlines** in a derived title: strip.
 - **Leading/trailing whitespace and dots**: strip (a leading dot hides the folder).
-- **Length:** APFS limits a single filename component to 255 **bytes** (not
-  characters). The date and origin parts are preserved intact; the **title** is
-  truncated on a word boundary until the whole component fits in 255 bytes when
-  UTF-8 encoded. Non-ASCII titles hit this sooner than they look.
-- **Unicode normalisation:** macOS normalises filenames toward NFD. Compare and
-  deduplicate paths using `unicodedata.normalize("NFC", ...)` on both sides, or
-  re-running on the same video with an accented title will create a second folder.
+- **Length:** the practical macOS limit is 255 **UTF-8 characters** per path component
+  (the on-disk field is larger). The date and origin parts are preserved intact; the
+  **title** is truncated on a grapheme boundary until the whole component fits.
+  Truncating at 255 *bytes* would also be safe but cuts non-ASCII titles up to four
+  times earlier than necessary, which defeats the point of preserving the title.
+- **Unicode normalisation:** normalise to NFC before writing, and on both sides of any
+  path comparison. Note *why*: this is hygiene for network shares and external
+  (non-APFS) volumes, not for APFS itself. APFS **preserves** whatever normalisation you
+  write and is normalisation-*insensitive* — an NFC and an NFD spelling of the same
+  accented title collide as the same directory, so the duplicate-folder failure cannot
+  occur locally. It was HFS+ that forced NFD.
 - **Collisions:** each screenshot folder contains a dotfile `.videoanalyser-source`
   holding the content hash of the video it came from — that is the ownership record.
   Dotfiles are exempt from R6's "exactly three folders" (they are files, not folders),
@@ -374,8 +387,11 @@ One scheme, used everywhere (R7.4):
 NN_lowercase-hyphen-description.png
 ```
 
-`NN` is a zero-padded two-digit ordinal in timeline order (`01`, `02`, …, then three
-digits past 99). The description is derived from what the screenshot shows, lowercased,
+`NN` is a zero-padded ordinal in timeline order, at a **fixed width chosen from the
+final count** for the whole folder (two digits up to 99 screenshots, three from 100).
+Mixing widths within a folder breaks lexicographic sort — `ls` and Finder would order
+`09, 10, 100, 101, 11, …`, and a long tutorial exceeds 99 routinely under §10.6's
+one-screenshot-per-step floor. The description is derived from what the screenshot shows, lowercased,
 non-alphanumerics collapsed to single hyphens, truncated to 60 characters.
 **No colons in filenames** — the colon is permitted only in the folder name, where
 R7's format demands it. Example: `03_click-upload-button.png`.
@@ -394,10 +410,13 @@ keyed by content hash so re-running on the same file resumes rather than redoes
 (§4.4). A `--clean` flag deletes the cache for one video; `--clean-all` empties it.
 §13.6 governs how large this is allowed to get.
 
-`~/Library/Caches` is chosen deliberately: **the macOS Desktop is iCloud-synced by
-default.** Writing tens of gigabytes of intermediate frames to a Desktop subfolder
-would queue all of it for upload. The workspace (small: Markdown, JSON, a few dozen
-screenshots) lives on the Desktop as the user asked; the bulk cache never does.
+`~/Library/Caches` is chosen deliberately: macOS offers an opt-in "Desktop & Documents
+Folders" iCloud Drive feature, prominently promoted during setup, and **if the user has
+it enabled** every intermediate frame written under the Desktop is queued for upload.
+It is opt-in rather than a default, but it is common enough that the cache must not
+depend on it being off. `~/Library` is outside that sync scope regardless. The
+workspace itself (Markdown, JSON, a few dozen screenshots) is small and lives on the
+Desktop as the user asked; the bulk cache never does.
 
 **No component may write to `/tmp`.** Every intermediate path is derived from the
 per-video cache directory. `/tmp` collides between concurrent videos and macOS purges
@@ -549,10 +568,14 @@ full per-frame timing table comes from `S3`'s single decode pass instead.
 
 Robustness rules, each of which fixes a crash the draft would have hit:
 
-- **Numeric parsing:** ffprobe emits the literal string `"N/A"` for `start_time`,
-  `duration`, `nb_frames` on MKV/WebM — which R1.1 requires supporting. Route every
-  numeric read through one helper that treats `"N/A"`, `None` and `""` as missing.
-  A bare `float(stream["start_time"])` raises `ValueError` on ordinary files.
+- **Numeric parsing:** with the JSON writer this section mandates, ffprobe **omits**
+  `duration` and `nb_frames` entirely on MKV/WebM rather than emitting `"N/A"` — the
+  literal `N/A` appears only in the default flat writer. So the failure to absorb is a
+  **`KeyError` on an absent key**, not a `ValueError` from parsing `"N/A"`.
+  (`start_time` is present and numeric on both, so it is not one of the affected
+  fields.) Route every numeric read through one helper that treats an absent key,
+  `None`, `""` and `"N/A"` alike as missing — the last for safety if anyone switches
+  writers.
 - **Missing audio is normal, not exceptional.** `next(s for s in streams if ...)`
   raises `StopIteration` on a silent screen recording or an AI-generated clip
   (R1.3.d). Use a default and carry an explicit `has_audio: bool`. With no audio,
@@ -564,12 +587,20 @@ Robustness rules, each of which fixes a crash the draft would have hit:
   transcribe the selected one, and pass an explicit `-map 0:a:<idx>` so the track
   transcribed is provably the track probed. Bare `-vn` lets ffmpeg pick a different
   "best" stream than the one described.
-- **Rotation: do nothing.** Modern ffmpeg auto-applies the display matrix. The draft's
-  `-vf "rotate=90"` is wrong three times over: that filter takes **radians** (90 rad ≈
-  5157°), it does not resize the canvas so content is cropped away, and it double-rotates
-  something ffmpeg already handled. Record orientation for reporting only, reading
-  `side_data_list[].rotation` with a `tags.rotate` fallback, and take real dimensions
-  from a decoded frame rather than stream metadata.
+- **Rotation: never hand-roll it — but the two decoders disagree, and that matters.**
+  The ffmpeg **CLI** applies the display matrix automatically (`-autorotate`, on by
+  default). **PyAV does not** — it exposes the display matrix as side data and returns
+  un-rotated frames. Since `S3` decodes with PyAV (§5.4) and `S8` exports with the
+  ffmpeg CLI (§7.1), a rotated iPhone capture would otherwise produce a **descriptor
+  series transposed relative to the exported screenshots**, breaking `SC6` on two of
+  the five mandatory archetypes with no diagnosis.
+  **Rule:** read `side_data_list[].rotation` at probe time into `probe.rotation`. In
+  `S3`, apply that rotation explicitly to each decoded frame before computing the
+  descriptor. In `S8`, apply nothing — the CLI has already done it. Assert that the
+  exported frame's dimensions match the descriptor's orientation.
+  The draft's `-vf "rotate=90"` was wrong three times over regardless: that filter takes
+  **radians** (90 rad ≈ 5157°), it does not resize the canvas so content is cropped
+  away, and it double-rotates what the CLI already handled.
 - **HDR / 10-bit:** if `color_transfer` is `smpte2084` or `arib-std-b67`, insert a
   tonemap filter before RGB conversion, or 4K HDR screen recordings produce washed-out
   screenshots.
@@ -605,8 +636,12 @@ def to_master(t_local: float, stream: Literal["audio", "video"]) -> float: ...
   contradicted its own correction rule elsewhere with no tiebreak. Measure the offset
   empirically from leading packet PTS through the same decode path extraction uses,
   and apply it in exactly one function.
-- **Test:** remux a known file with `-itsoffset 0.4` on the audio; the pipeline must
-  report 0.4 s. This test is mandatory (§15).
+- **Test:** remux a known file with `-itsoffset 0.4` on the audio and assert the
+  pipeline recovers it. **Generate the fixture with PCM/WAV audio**, where the offset is
+  sample-exact. With AAC the offset snaps to the 1024-sample packet grid (~23.2 ms) and
+  lands at 0.376 s, so an equality assertion against 0.400 fails by 24 ms through no
+  fault of the pipeline. If AAC must be used, assert against the container's actual
+  first-packet PTS with a tolerance of one audio frame. This test is mandatory (§15).
 
 ### 5.4 The single dense visual pass (`S3_VISUAL_SCAN`)
 
@@ -676,8 +711,14 @@ Segmentation from the dense descriptor series:
   exceeds `anchor_delta_floor`.
 - **Cap state duration** at `max_state_seconds` (default 10) so the worst case is
   bounded regardless.
-- Cross-check boundaries against `scenedetect`'s `AdaptiveDetector` run over the same
-  descriptor series (not a second decode) to catch fades and dissolves.
+- **Fade/dissolve detection runs in-process, not via `scenedetect`.** `ContentDetector`
+  (which `AdaptiveDetector` inherits) calls `cv2.cvtColor(frame, COLOR_BGR2HSV)` and
+  therefore requires a 3-channel BGR image — it cannot consume the 64×64 grayscale
+  descriptor, and feeding it one raises inside `cvtColor`. Rather than pay a second
+  decode, detect gradual transitions directly from the descriptor series: a fade is a
+  sustained monotonic ramp in mean luminance with low block-variance, a dissolve a
+  sustained elevated delta without a single-frame spike. `scenedetect` remains a
+  dependency only for offline calibration of the thresholds, not for the hot path.
 - The state list MUST satisfy: `states[0].span.start == 0`,
   `states[i].span.end == states[i+1].span.start`, and
   `states[-1].span.end == timeline_end`. Assert it.
@@ -861,8 +902,9 @@ Silence intervals, music/speech segmentation, tempo, key, energy, and sound even
   axis at all — and then reported per-event `start_time`/`end_time` values that no code
   produced. Fabricated timestamps in the section whose purpose is timeline integrity,
   flowing into R5's "physically grounded durations, not imaginary numbers".
-- `librosa.feature.tempo`, not `librosa.beat.tempo` (removed in ≥0.10.1); it returns an
-  ndarray, so index before formatting.
+- Use `librosa.feature.tempo`. `librosa.beat.tempo` still works in the pinned 0.11.0
+  but emits a `FutureWarning` — it moved in 0.10.0 and is slated for removal in 1.0.
+  It returns an ndarray, so index before formatting.
 - Process in 60-second windows via `librosa.stream`. A full-file `chroma_cqt` +
   `tempogram` on a 90-minute track is multi-GB of intermediates and 5–15 minutes
   (§13.3).
@@ -904,8 +946,11 @@ Write **JPEG q≈2** to the cache, not PNG. A 4K PNG is 8–20 MB; the draft's o
 arithmetic reached 21.6 GB of intermediates for one 90-minute video, guarded by a 1 GB
 free-space check. PNG is used only for frames promoted to the deliverable (§11).
 
-Add `-vf scale=in_range=tv:out_range=pc` when the source is limited-range BT.709
-(the normal case), or every exported screenshot is visibly washed out.
+Add `-vf scale=in_range=tv:out_range=pc` **only when the source is untagged**. swscale
+already expands correctly when the stream carries a limited-range tag, and `out_range`
+is meaningless for an RGB destination (RGB is full-range by definition) — so on a
+properly tagged file the flag is a no-op. The load-bearing half is `in_range=tv` on
+untagged sources, which is where the washed-out screenshots actually come from.
 
 ### 7.2 OCR
 
@@ -936,8 +981,8 @@ The draft used a single `lead_lag_tolerance = 1.0 s` for two unrelated things. S
   here" a beat before clicking). **Measure and report its distribution; never use it as
   a correctness gate.** Defaults for search windows: −0.5 s lead, +1.5 s lag.
 
-A 1.0 s tolerance is ~30× looser than human perceptibility (EBU R37 puts acceptable A/V
-offset near +40/−60 ms) and is precisely why the draft's sync checks could not detect a
+A 1.0 s tolerance is 17–25× looser than human perceptibility (EBU R37 puts acceptable
+A/V offset near +40/−60 ms) and is precisely why the draft's sync checks could not detect a
 400 ms error.
 
 ### 8.2 Binding by containment, not nearest-neighbour
@@ -1447,7 +1492,7 @@ fan-out and remediation rounds, **$235–400**. This section is why.
 
 ### 13.1 Frame budget and model routing
 
-**One frame budget, referenced everywhere.** The draft had four contradictory ones
+**One frame budget, referenced everywhere.** The draft had five contradictory ones
 (100, 50, 200–300, 1 fps, 6–10).
 
 ```
@@ -1481,6 +1526,11 @@ one number:
 |---|---|---|---|
 | `claude-haiku-4-5` (B1, the bulk) | ~1,600 tok | ~786 tok | ~2× |
 | `claude-sonnet-5` / `claude-opus-5` | ~4,784 tok | ~786 tok | ~6× |
+
+**786 tokens assumes a 16:9 (or 9:16) frame at 1024 px on the long edge.** Image cost is
+`width × height / 750`, so a square or near-square UI crop at 1024 px costs ~1,398
+tokens — 1.8× the budgeted figure. Budget per frame from actual dimensions, not from a
+flat constant.
 
 Downscaling is safe because the on-screen text has already been read locally by OCR
 (§7.2) and is supplied to the model as text. Sending 4K frames so a paid model can re-read text you already
@@ -1531,15 +1581,23 @@ roughly 10.6 GB, a smaller pool than the draft assumed. Audio features stream in
 2. **Prime before fan-out.** Concurrent requests sharing a prefix **all miss** — none
    has written the cache yet. Issue one cheap **synchronous, non-batch** priming request
    carrying the exact prefix, await the response, *then* fan out. With a 20k-token
-   prefix and ten personas: naive 10 × 20k × 1.25 = 250k billed tokens, versus
-   20k × 1.25 + 9 × 20k × 0.1 = 43k. Priming cannot itself be part of a batch, because
-   a batch is submitted atomically.
+   prefix and ten personas, at the **5-minute** write rate (1.25×): naive
+   10 × 20k × 1.25 = 250k billed tokens, versus primed 20k × 1.25 + 9 × 20k × 0.1 = 43k.
+   At the **1-hour** rate (2×) the same comparison is **400k versus 58k** — quote the
+   multiplier you actually chose, or the saving is overstated. Priming cannot itself be
+   part of a batch, because a batch is submitted atomically; issue it synchronously
+   immediately before submission.
 3. **Batch API.** This workload is entirely offline and non-interactive — the textbook
    fit. 50% off, up to 100k requests per batch, results retrievable for 29 days. Submit
    each phase as one batch. This also makes crash recovery free (§4.4).
-   **Caching and batching interact:** a batch is only guaranteed to finish within 24 h,
-   so a batch running longer than the cache TTL loses the cache mid-flight. Treat the
-   cache discount as best-effort on batched phases and do not build the budget on it.
+   **Batching is opt-in (`--batch`), not the default.** Batches usually complete within
+   an hour but are only *guaranteed* within 24 h, which is incompatible with §15.3's
+   12-minute wall-clock criterion for a short video. Default to synchronous calls for
+   interactive runs; use `--batch` for long videos and overnight directory runs, where
+   halving the cost matters more than latency. §13.2's runtime table assumes synchronous.
+   **Caching and batching also interact:** a batch outliving the cache TTL loses the
+   cache mid-flight, so treat the discount as best-effort on batched phases and never
+   build the budget on it.
 
 Verify caching per phase: assert `cache_creation_input_tokens > 0` on the **priming**
 call, and `cache_read_input_tokens > 0` on the **first fanned-out** call. Asserting a
@@ -1547,9 +1605,32 @@ read on the priming call is wrong — that call is the one doing the write.
 
 ### 13.5 Budget control
 
+**What a run actually costs.** §13 exists to replace a number that was wrong by two
+orders of magnitude, so it must state its own. At the prices in §13.1, a 300-frame cap,
+1024 px frames, and a realistic persona fan-out:
+
+| | 7-minute video | 90-minute video |
+|---|---|---|
+| B1 per-state description (Haiku, cached prefix) | ~$0.12 | ~$1.07 |
+| Domain personas C1–C9 (Sonnet 5) | ~$0.35 | ~$3.24 |
+| Audit + synthesis D1–D5, E1 (Opus 5) | ~$0.40 | ~$4.50 |
+| **Subtotal** | **~$0.87** | **~$8.81** |
+| With `--batch` (50% off) | ~$0.44 | ~$4.41 |
+| Worst case, both repair rounds fired | ~$1.20 | ~$8.91 |
+
+So a routine 90-minute video is **$4–9**, not $118–197. Two consequences the numbers
+force: the frame cap bounds only the *image* line item (~$0.20 of the Haiku figure) —
+the money is in persona fan-out over the transcript and state descriptions, so that is
+where the budget lever belongs; and `confirm_threshold_usd` must not sit below the
+routine long-video cost or every 90-minute run blocks on a prompt. Hence the $5.00
+default in §14.3, not $2.00.
+
+Sonnet 5 also carries an introductory $2/$10 per MTok through 2026-08-31, so estimates
+built on the $3/$15 list price are conservative until then.
+
 - **Estimate before spending.** `--dry-run` prints projected frames, tokens and dollars
-  per model, and exits. Above `confirm_threshold_usd` (default $2.00) an interactive run
-  requires confirmation.
+  per model, and exits. Above `confirm_threshold_usd` an interactive run requires
+  confirmation.
 - The check is **pre-call**: "would this call exceed the cap?" A post-hoc check always
   overshoots by at least one call.
 - The cap is **global across a directory run**, not per video. Per-video caps let a
@@ -1570,9 +1651,17 @@ read on the priming call is wrong — that call is the one doing the write.
 ### 13.7 Rate limits and retries
 
 Read `anthropic-ratelimit-*` response headers and self-throttle. Honour `retry-after`.
-Full-jitter exponential backoff to a 60 s cap, ≥ 8 attempts, for 429/529 only; never
-retry 4xx. The draft's three attempts at 1/2/4 s exhaust in seven seconds against a
-sustained rate limit.
+Full-jitter exponential backoff to a 60 s cap, ≥ 8 attempts.
+
+**Retry exactly these:** 408, 409, 429, all 5xx (including 529), and connection/timeout
+errors. **Never retry** any other 4xx — 400, 401, 403, 404 are deterministic. Note that
+429 *is* a 4xx, so "retry 429 but never 4xx" is self-contradictory and must not be
+written that way.
+
+**Do not stack retries.** The `anthropic` SDK already retries 408/409/429/5xx with
+backoff (`max_retries=2` by default). If this pipeline wraps calls in `tenacity`,
+construct the client with `max_retries=0`, or the two layers multiply and a sustained
+rate limit produces far more attempts than intended.
 
 **Never silently skip work.** The draft's rule — "retry 3 times, then skip frame" —
 violates R8.2 outright. Dropped frames are recorded and surfaced in the Analysis
@@ -1580,9 +1669,11 @@ Integrity block; > 2% dropped is a non-zero exit.
 
 ### 13.8 No network call at startup
 
-Validate the API key's *format* only. The draft made a live billable `models.list()`
-call on every launch and treated failure as fatal, which breaks `--dry-run`, breaks
-offline re-runs from cache, and fails for any user without the second vendor's key.
+Validate the API key's *format* only. The draft called `models.list()` on every launch
+and treated failure as fatal, which breaks `--dry-run`, breaks offline re-runs from
+cache, and fails for any user without the second vendor's key. (That call consumes no
+tokens — it is not billable — but it is still a network dependency at startup for no
+benefit. Let the first real call surface an auth error.)
 
 ---
 
@@ -1678,8 +1769,9 @@ models:
   synthesise: "claude-opus-5"
 
 budget:
-  max_usd: 5.00                  # global for the invocation, not per video
-  confirm_threshold_usd: 2.00
+  max_usd: 25.00                 # global for the invocation, not per video
+  confirm_threshold_usd: 5.00    # above the routine 90-min cost (§13.5), so long
+                                 # videos do not block on a prompt every run
   max_dropped_frame_fraction: 0.02
 
 qa:
@@ -1749,7 +1841,8 @@ The build is done when:
 
 1. Every fixture in §15.1 processes without error, or fails with a clear diagnosis.
 2. Every gate in §12.1 is proven to fire by a test in §15.2.
-3. `SC1`–`SC6` (§5.6) pass on all fixtures; the `-itsoffset` fixture reports 0.4 s.
+3. `SC1`–`SC6` (§5.6) pass on all fixtures; the PCM `-itsoffset` fixture recovers
+   0.400 s exactly (see §5.3 on why the fixture must not use AAC).
 4. The R7 folder name for a known input is byte-identical to the required format, and
    `os.listdir` returns it exactly.
 5. Every `![](...)` in every generated document resolves.
