@@ -81,9 +81,10 @@ Ordered by how badly they would have hurt, not by which section they came from.
    "~$0.65 per hour of video". Under its own literal sampling rule (1 fps to a vision
    model at up to 4,784 tokens per image), a 90-minute video costs **$118–197**, and
    **$235–400** once persona fan-out and remediation rounds are counted. Fixed by a
-   single frame budget, 1024 px downscaling (6× token reduction), model routing by task,
-   prompt caching, cache priming before fan-out, and the Batch API — together bringing
-   the 90-minute case to roughly **$12–18**. (`PLAN.md` §13.)
+   single frame budget, 1024 px downscaling, model routing by task, prompt caching,
+   cache priming before fan-out, and opt-in batching. (`PLAN.md` §13.) The corrected
+   figure was worked out properly in round 2 — see that section for the final numbers;
+   the estimate recorded here at the time was itself too optimistic.
 
 2. **The audio offset was computed, stored, and never applied.** The draft derived
    `audio_start − video_start`, wrote it into a manifest, then extracted audio with a
