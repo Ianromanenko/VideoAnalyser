@@ -121,7 +121,7 @@ these as lower bounds in `requirements.txt`.
 | `av` | 18.0.0 | PyAV. Reads real per-frame presentation timestamps from the container. **This is the package that makes R2.4 achievable** — see §5.2. |
 | `ffmpeg-python` | 0.2.0 | Ergonomic wrapper for ffmpeg/ffprobe invocations. |
 | `scenedetect` | 0.7.1 | Shot/scene boundary detection (`ContentDetector`, `AdaptiveDetector`). Handles fades and dissolves that a naive histogram diff misreads. |
-| `ImageHash` | 4.3.2 | Perceptual hashing for near-duplicate frame elimination (§7.3). |
+| `ImageHash` | 4.3.2 | Perceptual hashing for near-duplicate frame elimination (§5.5). |
 | `Pillow` | 10.4.0 | Image loading, cropping, downscaling, annotation, PNG/WebP encoding. |
 | `numpy` | 1.26.0 | Array backbone for everything below. |
 
@@ -639,29 +639,29 @@ The draft had six checks and concluded "R2.4 satisfied". Inject a uniform +400 m
 shift into every transcript timestamp and all six still pass — they are
 self-consistency checks, not sync checks. These are the replacements.
 
-**C1 — Cross-modal offset (the one that actually matters).** Compute a speech-energy
+**SC1 — Cross-modal offset (the one that actually matters).** Compute a speech-energy
 envelope from the audio at 100 Hz and the visual-activity envelope already produced by
 `S3`. Cross-correlate over ±2 s in 10 ms steps. Assert `|peak lag| ≤ 50 ms`. On
 screen-recording content, additionally measure the offset between spoken phrases and
 the appearance of matching OCR text. **This is the only check that can detect a
 constant A/V offset, which is the most likely real-world sync failure.**
 
-**C2 — Interval coverage.** Coverage is the **union of analysed intervals** over the
+**SC2 — Interval coverage.** Coverage is the **union of analysed intervals** over the
 timeline, not `max(last_word, last_frame) / duration`. Under the draft's formula, a
 video with one word at the end scores 99.8% while forty minutes in the middle are
 missing. Require ≥ 99% union coverage with **no unexplained gap > 2 s**, where
 "explained" means overlapping a positively detected silence or music interval.
 
-**C3 — Visual partition integrity.** Assert the state list partitions the timeline
+**SC3 — Visual partition integrity.** Assert the state list partitions the timeline
 exactly (§5.5), all PTS strictly increasing, none negative after epoch subtraction.
 
-**C4 — Forced-alignment residual.** Median `|t_asr − t_forced|` ≤ 150 ms (§6.4). A
+**SC4 — Forced-alignment residual.** Median `|t_asr − t_forced|` ≤ 150 ms (§6.4). A
 larger residual means the ASR timestamps drifted and the run must not proceed silently.
 
-**C5 — Offset round-trip.** The `-itsoffset` test of §5.3, run against a generated
+**SC5 — Offset round-trip.** The `-itsoffset` test of §5.3, run against a generated
 fixture on every CI run.
 
-**C6 — Sampled re-extraction.** Re-extract 5% of representative frames at their
+**SC6 — Sampled re-extraction.** Re-extract 5% of representative frames at their
 recorded timestamps and assert the descriptor matches the stored frame. This catches
 any residual timestamp/file mismatch.
 
@@ -725,7 +725,7 @@ Whisper's native word times come from cross-attention DTW and are routinely ±20
 — not good enough for R2.3, and worse under int8 quantisation.
 
 1. Run WhisperX forced alignment (wav2vec2) over Whisper's text. Store `t_asr`,
-   `t_forced`, and the residual. Gate `C4` (§5.6) hard-fails if median residual
+   `t_forced`, and the residual. Gate `SC4` (§5.6) hard-fails if median residual
    > 150 ms.
 2. **Hallucination guard.** On music-only and silent stretches — which is the entirety
    of the user's R1.3.a and R1.3.d archetypes — Whisper emits confident subtitle-credit
@@ -813,7 +813,7 @@ Add `-vf scale=in_range=tv:out_range=pc` when the source is limited-range BT.709
 
 `ocrmac` (Apple Vision) over each representative frame. Store text **and bounding
 boxes** — the boxes are required for step-field extraction (§10.4) and optional
-annotation (§11.3), and the draft specified annotation while producing no coordinates
+annotation (§11), and the draft specified annotation while producing no coordinates
 anywhere.
 
 **OCR output is passed to the vision model as text.** Sending a full-resolution frame
@@ -988,7 +988,7 @@ handed in-memory frame objects, so nothing ever verified the delivered PNGs — 
 R3.7's "no broken links, no garbage" duty unowned.
 
 The dependency graph is published once as a DAG in code. The draft carried a cycle
-(A2 depended on A3 while A3 depended on A2), referenced two personas that did not exist,
+(two Pass-A personas each depended on the other), referenced two personas that did not exist,
 and gave one persona three mutually incompatible positions.
 
 ### 9.5 Claim classes — including the one that makes R5 answerable
@@ -1506,7 +1506,7 @@ The build is done when:
 
 1. Every fixture in §15.1 processes without error, or fails with a clear diagnosis.
 2. Every gate in §12.1 is proven to fire by a test in §15.2.
-3. `C1`–`C6` (§5.6) pass on all fixtures; the `-itsoffset` fixture reports 0.4 s.
+3. `SC1`–`SC6` (§5.6) pass on all fixtures; the `-itsoffset` fixture reports 0.4 s.
 4. The R7 folder name for a known input is byte-identical to the required format, and
    `os.listdir` returns it exactly.
 5. Every `![](...)` in every generated document resolves.
@@ -1524,8 +1524,8 @@ The build is done when:
 |---|---|---|
 | M1 | Skeleton: CLI, config, workspace, cache, stage ledger | `--dry-run` works on a real file |
 | M2 | `S1`–`S4`: probe, dense scan, states | State list partitions the timeline on all fixtures |
-| M3 | `S5`–`S7`: transcript, alignment, audio features | Word timestamps verified; `C4` passes |
-| M4 | `S8`, `S10`, `S11`: representatives, alignment, **sync proofs** | **`C1`–`C6` pass. Do not proceed until they do.** |
+| M3 | `S5`–`S7`: transcript, alignment, audio features | Word timestamps verified; `SC4` passes |
+| M4 | `S8`, `S10`, `S11`: representatives, alignment, **sync proofs** | **`SC1`–`SC6` pass. Do not proceed until they do.** |
 | M5 | `S12`: personas, prompts, grounding, evidence resolution | Every prompt file exists; `G9` passes |
 | M6 | `S13`: assembly, screenshots, delivery modes | A real tutorial produces a usable document |
 | M7 | `S14`: gates + negative tests | Every gate proven to fire |
@@ -1567,7 +1567,7 @@ document rather than an error.
 | R5.6 | Transferability | §9.2 (C5) |
 | R6 | `Video Analysis` + three folders | §3.1 |
 | R7 | Screenshot folder naming | §3.2, §3.3, §3.3a, G12 |
-| R8.1–8.3 | Maximum detail, lose nothing | §10.2, §13.7, C2 |
+| R8.1–8.3 | Maximum detail, lose nothing | §10.2, §13.7, SC2 |
 | R8.4 | No garbage, no broken links | G2, G3, G4, G11, D5 |
 | R9.4 | Executable with no prior context | This document; §9.9 |
 
