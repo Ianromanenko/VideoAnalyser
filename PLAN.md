@@ -451,7 +451,7 @@ it mid-run.
 
 | ID | Stage | Consumes | Produces | Parallel with |
 |---|---|---|---|---|
-| `S1_PROBE` | Container/stream interrogation, **plus 5 evenly-spaced framing frames** (rotation applied per `probe.rotation`, ≤1024 px, written to `framing_frames/`) | video file | `probe.json`, `framing_frames/*.jpg` | — |
+| `S1_PROBE` | Container/stream interrogation, **plus 5 evenly-spaced framing frames** (rotation: **none** — the ffmpeg CLI autorotates, §5.2; ≤1024 px, written to `framing_frames/`) | video file | `probe.json`, `framing_frames/*.jpg` | — |
 | `S9a_FRAMING` | Personas A1, A2 — provenance and category. **Runs early**: `S6` needs `A2.multi_speaker` to decide whether to diarize (§6.5) | `probe.json`, `framing_frames/*.jpg` | `personas/A*.json` | S2, S3 |
 | `S2_AUDIO_EXTRACT` | Extract ASR WAV (16 kHz mono) + analysis WAV (48 kHz stereo) | `probe.json` | `asr.wav`, `analysis.wav` | S3 |
 | `S3_VISUAL_SCAN` | **Single dense decode**, segmentation included: per-frame PTS, per-tile features, activity envelope, **and** the state partition | `probe.json` | `frames.parquet`, `activity.npy`, `visual_states.json` | S2 |
@@ -560,7 +560,14 @@ class Step(BaseModel):                # the assembler's contract for §10.4
     tool: str | None                  # physical route (R4.10)
     consumable: str | None
     parameters: dict[str, str] = {}   # grit, rpm, angle, passes, depth
-    screenshot_ids: list[str]         # >= 1 (R4.8)
+    backing_states: list[int]         # >= 1 state indices, assigned by S10.
+                                      # This is what S10 can actually know.
+    screenshot_ids: list[str]         # filled in by S13 after the export set is
+                                      # frozen; ALWAYS EMPTY at S10 emission, for
+                                      # the same reason visual_backup is — see the
+                                      # note above. G8 and D4 validate the >= 1
+                                      # requirement (R4.8) after S13's backfill,
+                                      # never before.
     evidence: list[str]
     merged_from: list[int] = []       # visual states merged under §13.1
 
@@ -1488,6 +1495,13 @@ both Optional for exactly that reason. `G8` reads this table:
 | `consumable` | — | required when one is used |
 | `parameters` | — | required, ≥ 1 entry |
 | `watch_out` | optional | optional |
+
+**`G8` runs in `S14`, after `S13` has backfilled `screenshot_ids`.** `S10` emits
+`backing_states`; it cannot emit screenshot ids, which are not determined until the
+export set is frozen and §3.3c's filename width is chosen. Enforcing `≥ 1
+screenshot_ids` at `S10` would fail every step on every tutorial, burn both repair
+rounds, and quarantine the run — the same trap the `Claim` model avoids for
+`visual_backup`.
 
 A step in a video with both classes must satisfy whichever class its own evidence
 supports; if both, both. Read literally without this table, `G8` fails every step ever

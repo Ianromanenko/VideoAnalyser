@@ -31,7 +31,8 @@ re-run a real `grillme` pass later against the same document.
 | 4 | Convergence check | 7 | 7 | 0 | closed |
 | 5 | Convergence re-check | 5 | 5 | 0 | closed |
 | 6 | Convergence re-check | 3 | 3 | 0 | closed |
-| 7 | Convergence re-check | _in progress_ | | | |
+| 7 | Convergence re-check | 2 | 2 | 0 | closed |
+| 8 | Final sign-off check | _in progress_ | | | |
 
 ---
 
@@ -513,3 +514,35 @@ reasons. That restraint is what makes the three it did report worth acting on.
    export resolves.
 
 **Trend:** 126 → 46 → 10 → 7 → 5 → 3.
+
+---
+
+## Round 7 — convergence re-check
+
+Two blocking findings, both text-level contradictions, with the reviewer stating it
+would sign off once they were applied. It also listed five things it had considered and
+deliberately declined to report, with reasons — the restraint that makes the remaining
+two credible.
+
+1. **The stage table ordered the exact double-rotation §5.2 forbids.** Round 6 added
+   `SC6` to the rotation enumeration and got every site right — but `S1`'s row in §4.2
+   still read "rotation applied per `probe.rotation`", while §5.2 lists `S1` as an
+   apply-nothing site because it goes through the autorotating ffmpeg CLI. Two normative
+   statements, directly contradictory, and the stage table is the implementation
+   checklist an engineer works from. At 90°/270° the framing frames come out transposed
+   and the aspect assertion turns it into a crash; at 180° the assertion passes and the
+   frames are simply upside-down — which §5.2 itself says nothing can catch, because
+   those five frames are all `A1` and `A2` ever see.
+
+2. **`Step.screenshot_ids` had the chicken-and-egg problem round 6 fixed for claims.**
+   The field is declared `>= 1` and required by blocking gate `G8`, and its declared
+   producer is `S10` — which runs *earlier* than the persona stage where §4.3's own
+   comment establishes that screenshot ids are "not yet determined". Enforced at
+   emission, every step on every tutorial fails validation, burns both repair rounds and
+   quarantines; unenforced, two owners write two different id namespaces and `G8` may
+   validate the wrong one. `step_id`, `backing_state` and `visual_backup` all carried
+   explicit ownership annotations; this one carried none. Fixed with the same pattern:
+   `S10` emits `backing_states`, `S13` backfills `screenshot_ids`, and `G8`/`D4` validate
+   after the backfill.
+
+**Trend:** 126 → 46 → 10 → 7 → 5 → 3 → 2.
