@@ -1,6 +1,6 @@
 # Grill Log
 
-Adversarial review of `docs/PLAN.md`, per requirement R9.2 (up to 20 interactions, early stop
+Adversarial review of `PLAN.md`, per requirement R9.2 (up to 20 interactions, early stop
 once the plan holds up).
 
 **Note:** the `grillme` skill is not installed in this environment (checked: no user skill,
@@ -16,7 +16,7 @@ re-run a real `grillme` pass later against the same document.
    find problems, not to praise.
 2. Every finding is recorded below with a verdict: **FIXED**, **REJECTED** (with reason), or
    **DEFERRED** (with reason).
-3. A finding is only "fixed" when `docs/PLAN.md` actually changed.
+3. A finding is only "fixed" when `PLAN.md` actually changed.
 4. The loop stops early when a round produces no finding that changes the plan's substance.
 5. Hard ceiling: 20 rounds.
 
