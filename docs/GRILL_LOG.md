@@ -32,7 +32,7 @@ re-run a real `grillme` pass later against the same document.
 | 5 | Convergence re-check | 5 | 5 | 0 | closed |
 | 6 | Convergence re-check | 3 | 3 | 0 | closed |
 | 7 | Convergence re-check | 2 | 2 | 0 | closed |
-| 8 | Final sign-off check | _in progress_ | | | |
+| 8 | Final sign-off check | **0** | — | — | **CONVERGED — loop closed** |
 
 ---
 
@@ -546,3 +546,50 @@ two credible.
    after the backfill.
 
 **Trend:** 126 → 46 → 10 → 7 → 5 → 3 → 2.
+
+---
+
+## Round 8 — final sign-off
+
+**Zero blocking findings. Verdict: CONVERGED.** Per rule 4 of the loop, the review stops
+here — a round that produces no finding changing the plan's substance is the stopping
+condition, reached at round 8 of a permitted 20.
+
+The reviewer re-checked the six pairs of statements most likely to collide and found no
+contradiction: `sanitize_colon` across §3.3/§3.3a/`G12`; `max_state_seconds` against
+§13.1's merging exception; `M4`'s "SC1–SC6 pass" against SC1's `INCONCLUSIVE` outcome;
+§9.10's `[CONFLICT]` marker against `G11`'s sentinel ban; `G6`'s `has_speech` against
+`SC2`'s `has_audio`; and §3.1's "exactly three subfolders" against `outputs/_quarantine/`.
+
+All fourteen gates are implementable, with every threshold they need carrying a literal
+default in §14.3. The three that were judgement calls in earlier rounds — `G1`, `G8`,
+`G14` — now have computable predicates, and the ordering constraint that `G8` and `G14`
+run after `S13`'s backfill is stated consistently in all three places it matters.
+
+Every requirement resolves to a named mechanism, including the ones that were unowned in
+the drafts: R4.4/R4.5/R5.4 (general description, short summary, project-time estimate),
+R4.7 (forced export), R4.3 (meeting points, after the routing predicate was widened to
+cover the archetype it was silently losing), R5.5 (elision markers) and R5.2.
+
+Two ambiguities were identified and **deliberately not raised as blocking**: `E1`'s
+owning stage is implied rather than named in §4.2's table, and the JPEG-cache to
+deliverable-PNG promotion has no named producing step. Both are implementable as
+written, and the reviewer judged that a patch cycle on either carries more regression
+risk than the ambiguity does. Recorded here rather than fixed, so the next reader knows
+they were seen and weighed.
+
+---
+
+## Final tally
+
+| | |
+|---|---|
+| Rounds | 8 (of 20 permitted) |
+| Independent reviewer invocations | 15 |
+| Findings raised | **215** |
+| Findings fixed | 215 |
+| Findings rejected with reason | 2 |
+| Findings recorded but deliberately not fixed | 2 |
+| Trend | 12 → 126 → 50 → 10 → 7 → 5 → 3 → 2 → **0** |
+
+The loop stopped because it converged, not because it ran out of budget.
