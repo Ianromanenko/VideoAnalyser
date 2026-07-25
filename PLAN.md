@@ -54,7 +54,8 @@ work (R1.3):
 
 ### 1.2 Outputs
 
-Per processed video, exactly three things:
+Per processed video, three artifacts at minimum (delivery modes in §10.8 may add
+derived files, and a failed QA run quarantines instead — §12.3):
 
 1. **One Markdown file** in `outputs/` (R6.2) containing everything in R4.
 2. **One screenshot folder** in `screenshots/` (R6.3), named per R7.
@@ -91,10 +92,17 @@ Everything in §13 (memory and cost control) exists because of this section.
 
 ### 2.2 Python
 
-Target **Python 3.12**. Accept 3.11–3.13.
+Target **Python 3.12**. Accept **3.11–3.12 only**.
 
-The ceiling is not arbitrary: `whisperx` declares `>=3.10,<3.14`, which is the
-tightest constraint in the tree. Do not target 3.14+ until that lifts.
+The ceiling is set by the tightest constraint actually in the tree, not by the loosest:
+`whisperx` declares `>=3.10,<3.14`, but `rapidocr-onnxruntime` declares `<3.13`. On
+3.13 the interpreter check would pass and `pip install` would then hard-fail — exactly
+the failure mode §2.4 exists to prevent. If the OCR fallback is dropped, the ceiling
+may rise to 3.13.
+
+**Known resolver conflict:** `whisperx` 3.8.6 pulls `numpy>=2.1`. Do not pin a
+`numpy<2` floor elsewhere; resolve the environment with `numpy>=2.1` and verify
+`librosa` and `opencv`-adjacent wheels agree at lock time.
 
 ### 2.3 System dependencies (Homebrew)
 
@@ -123,7 +131,8 @@ these as lower bounds in `requirements.txt`.
 | `scenedetect` | 0.7.1 | Shot/scene boundary detection (`ContentDetector`, `AdaptiveDetector`). Handles fades and dissolves that a naive histogram diff misreads. |
 | `ImageHash` | 4.3.2 | Perceptual hashing for near-duplicate frame elimination (§5.5). |
 | `Pillow` | 10.4.0 | Image loading, cropping, downscaling, annotation, PNG/WebP encoding. |
-| `numpy` | 1.26.0 | Array backbone for everything below. |
+| `numpy` | 2.1.0 | Array backbone. Floor set by `whisperx`, not chosen independently. |
+| `pyarrow` | 17.0.0 | Parquet I/O for `frames.parquet` (§4.2). Without it that artifact cannot be written. |
 
 **Audio and speech**
 
@@ -135,6 +144,7 @@ these as lower bounds in `requirements.txt`.
 | `pyannote.audio` | 4.0.7 | Speaker diarization ("who spoke when") — required by R1.3.b and R4.6. |
 | `librosa` | 0.11.0 | Tempo/BPM, key, spectral features, energy envelope — the music analysis behind R4.11. |
 | `soundfile` | 0.12.1 | WAV I/O. |
+| `silero-vad` | 5.1 | Independent VAD for the hallucination guard (§6.4). Must be a *different* VAD from any used inside the ASR, or the check is circular. |
 
 **Text on screen**
 
@@ -265,12 +275,20 @@ implementer must handle deliberately rather than discover:
 - **Unicode normalisation:** macOS normalises filenames toward NFD. Compare and
   deduplicate paths using `unicodedata.normalize("NFC", ...)` on both sides, or
   re-running on the same video with an accented title will create a second folder.
-- **Collisions:** if the target folder exists and belongs to a different source
-  video (compared by content hash, §4.4), append ` (2)`, ` (3)` … before creating.
+- **Collisions:** each screenshot folder contains a dotfile `.videoanalyser-source`
+  holding the content hash of the video it came from — that is the ownership record.
+  Dotfiles are exempt from R6's "exactly three folders" (they are files, not folders),
+  and this avoids needing a registry the workspace is not allowed to hold. If the target
+  folder exists and its recorded hash differs, append ` (2)`, ` (3)` … to the end of the
+  whole name. Gate `G12`'s R7 regex therefore admits an optional numeric suffix:
+
+  ```
+  ^(?P<title>.+) \| (?P<date>\d{2}\.\d{2}\.\d{4}) \| original: (?P<source>.+?)( \((?P<n>\d+)\))?$
+  ```
 
 ### 3.3a Who computes the folder name, and from what
 
-The naming rule above is useless without a named owner. Stage `S9_NAMING` (§4.2)
+The naming rule above is useless without a named owner. Stage `S9b_NAMING` (§4.2)
 constructs the folder name after provenance and categorisation are known and before
 any screenshot is written. Nothing else may construct it.
 
@@ -412,12 +430,19 @@ it mid-run.
 | `S6_DIARIZE` | Speaker turns (optional, §6.5) | `asr.wav` | `speakers.json` | — |
 | `S7_AUDIO_FEATURES` | Silence, music, tempo/key, sound events | `analysis.wav` | `audio_features.json` | — |
 | `S8_REPRESENTATIVES` | Choose representative frames; extract JPEGs; OCR them | `visual_states.json` | `representatives.json`, frame JPEGs | — |
-| `S9_NAMING` | Provenance + category + folder name (§3.3a) | `probe.json`, A1, A2 | `naming.json` | — |
+| `S9a_FRAMING` | Personas A1, A2 only — provenance and category | `probe.json`, few frames | `personas/A*.json` | — |
+| `S9b_NAMING` | Folder name (§3.3a) | `probe.json`, A1, A2 | `naming.json` | — |
 | `S10_ALIGN` | Bind words → states; clauses → states; steps → screenshots | S4, S5, S6, S8 | `alignment.json` | — |
 | `S11_VERIFY_SYNC` | The sync proofs of §5.6 — **gate** | S10 | `sync_report.json` | — |
-| `S12_PERSONAS` | The analysis roster (§9) | everything above | `personas/*.json` | internally parallel |
+| `S12_PERSONAS` | Passes B, C, D of the roster (§9.2) | everything above | `personas/*.json` | internally parallel |
 | `S13_ASSEMBLE` | Render Markdown + JSON sidecar + export screenshots | all | `.md`, `.json`, `screenshots/` | — |
-| `S14_QA` | Output gates of §12 — **gate** | S13 | `qa_report.json` | — |
+| `S13b_VERIFY_OUT` | Persona `D5` — verifies exported files (§9.4) | `S13` output | `personas/D5.json` | — |
+| `S14_QA` | Output gates of §12 — **gate** | S13b | `qa_report.json` | — |
+
+The framing personas are split out as `S9a` deliberately: `S9b_NAMING` needs `A1`/`A2`,
+and the rest of the roster needs the naming. Keeping all personas in one stage would
+make `S9 → S12 → S9` a cycle. Likewise `D5` runs as `S13b`, after export, because its
+job is to verify files that do not exist until then.
 
 `S11` and `S14` are **gates**: on failure the run does not silently continue (§12.3).
 
@@ -455,12 +480,31 @@ class VisualState(BaseModel):
     ocr_text: str | None
     ocr_boxes: list[OCRBox] = []
 
+class Step(BaseModel):                # the assembler's contract for §10.4
+    step_id: str                      # assigned by S10 only
+    span: TimeSpan
+    action_verb: str                  # MUST be from the controlled list, Appendix A
+    target: str                       # what is acted on
+    result: str
+    why: str
+    watch_out: str | None
+    application: str | None           # software route (R4.9)
+    url: str | None
+    tool: str | None                  # physical route (R4.10)
+    consumable: str | None
+    parameters: dict[str, str] = {}   # grit, rpm, angle, passes, depth
+    screenshot_ids: list[str]         # >= 1 (R4.8)
+    evidence: list[str]
+    merged_from: list[int] = []       # visual states merged under §13.1
+
 class Claim(BaseModel):
     text: str
     kind: Literal["fact", "inference", "domain_estimate"]   # see §9.5
     timestamp: str                  # "HH:MM:SS.mmm" — see §9.6
     evidence: list[str]             # e.g. ["word:1043-1051", "state:17", "ocr:state17#3"]
     confidence: float
+    visual_backup: str | None       # screenshot id; REQUIRED when needs_visual is True
+    needs_visual: bool = False      # set for any claim asserting on-screen appearance
 ```
 
 ### 4.4 Resume, caching, and the stage ledger
@@ -568,14 +612,25 @@ def to_master(t_local: float, stream: Literal["audio", "video"]) -> float: ...
 
 This replaces three separate decode passes and removes a whole class of timing bugs.
 
-```
-ffmpeg -hwaccel videotoolbox -i <input> -map 0:v:<idx> -vsync 0 \
-       -vf "scale=64:64:force_original_aspect_ratio=decrease,pad=64:64:-1:-1,format=gray" \
-       -f rawvideo -
+**Decode in-process with PyAV. Do not pipe `rawvideo` from an ffmpeg subprocess.**
+`-f rawvideo` emits headerless pixel bytes — no container, no `time_base`, no PTS — so
+the only way to time those frames would be to *count* them, which is exactly the
+positional join this section exists to eliminate.
+
+```python
+container = av.open(path)
+stream = container.streams.video[idx]
+stream.thread_type = "AUTO"
+for frame in container.decode(stream):
+    t = float(frame.pts * stream.time_base)          # master time, from the container
+    d = frame.reformat(width=64, height=64, format="gray").to_ndarray()
 ```
 
-Read the stream with **PyAV** rather than parsing ffmpeg's stderr, so each frame's
-`frame.pts * time_base` is read directly from the container. For every frame record:
+If a subprocess is ever used instead (e.g. to force hardware decode), the pipe format
+MUST be a timestamp-carrying container — `-f nut -` or `-f matroska -` — never
+`rawvideo`, and `-fps_mode passthrough` replaces the deprecated `-vsync 0` on ffmpeg 7.
+
+For every frame record:
 PTS (master time), a 64×64 grayscale descriptor, and the mean absolute difference from
 the previous frame. 64×64 gray is 4 KB per frame — a 90-minute 30 fps video is ~650 MB
 streamed, never stored; write only the derived table.
@@ -646,11 +701,32 @@ screen-recording content, additionally measure the offset between spoken phrases
 the appearance of matching OCR text. **This is the only check that can detect a
 constant A/V offset, which is the most likely real-world sync failure.**
 
+*Applicability.* SC1 requires `has_speech` **and** a correlation peak whose prominence
+clears `sc1_peak_prominence_floor`. It therefore does not apply to music-only,
+silent, or AI-generated clips (R1.3.a, R1.3.d), and it is inconclusive — not failing —
+on continuous narration over a static screen, where speech energy and visual activity
+are genuinely uncorrelated. In both cases SC1 reports `INCONCLUSIVE`, which is recorded
+in the Analysis Integrity block and does **not** block the run. Only a confident peak
+outside ±50 ms is a failure. A genuine encoder offset in the source is an input
+property the tool cannot repair: with `--allow-av-offset` the measured value is recorded
+and compensated rather than aborting.
+
 **SC2 — Interval coverage.** Coverage is the **union of analysed intervals** over the
 timeline, not `max(last_word, last_frame) / duration`. Under the draft's formula, a
 video with one word at the end scores 99.8% while forty minutes in the middle are
-missing. Require ≥ 99% union coverage with **no unexplained gap > 2 s**, where
-"explained" means overlapping a positively detected silence or music interval.
+missing.
+
+Coverage is computed **per modality** and both must hold:
+
+- *Visual*: the visual-state intervals must partition `[0, timeline_end)` exactly — 100%
+  by construction (SC3), so any shortfall is a bug.
+- *Audio* (only when `has_audio`): `union(word intervals ∪ detected-silence ∪
+  detected-music ∪ detected-non-speech)` must cover ≥ 99% of the audio span, with **no
+  unexplained gap > 2 s**, where "explained" means overlapping a positively detected
+  silence, music, or non-speech interval.
+
+With no audio track the audio clause is skipped and the Analysis Integrity block records
+the video as silent. It is never treated as an unexplained gap.
 
 **SC3 — Visual partition integrity.** Assert the state list partitions the timeline
 exactly (§5.5), all PTS strictly increasing, none negative after epoch subtraction.
@@ -701,6 +777,18 @@ the noise floor first (`ebur128`/`volumedetect`) and set the threshold at
 
 Default `mlx-whisper` with `large-v3`. Fallback `faster-whisper`.
 
+**The two backends have different APIs. Write an adapter; do not write against one and
+assume the other.** `mlx_whisper.transcribe()` returns plain dicts and does not accept
+`vad_filter`; `faster-whisper` returns objects and does. The mandatory behaviours below
+are stated once, with the per-backend realisation:
+
+| Behaviour | `mlx-whisper` (default) | `faster-whisper` (fallback) |
+|---|---|---|
+| Word timestamps | `word_timestamps=True` | `word_timestamps=True` |
+| Confidence field | `word["probability"]` (dict) | `word.probability` (attribute) |
+| VAD filtering | not applicable — does not VAD-filter | `vad_filter=False` (see below) |
+| Prior conditioning | `condition_on_previous_text=False` | `condition_on_previous_text=False` |
+
 Mandatory call parameters — each fixes a specific defect:
 
 - **`word_timestamps=True`.** Without it `segment.words` is `None` and the word loop
@@ -732,8 +820,11 @@ Whisper's native word times come from cross-attention DTW and are routinely ±20
    text spanning the silence. That text is monotonic, high-confidence and
    time-covering, so it passes every naive check, enters the "verbatim transcript",
    gets bound to frames, and is handed to Claude as fact under R5. Guard with all three:
-   - Run an independent VAD (silero) on the **un-filtered** audio; delete or hard-flag
-     any word whose interval is < 30% voiced.
+   - Run an independent VAD (silero) on the **un-filtered** audio and **flag** — never
+     delete — any word whose interval is < 30% voiced. Deleting words would violate
+     R4.6 and R8.2, and no gate would catch it (`G6` compares transcript *span*, not
+     word count). Set `hallucination_suspect: true` on the `Word`, render it inline in
+     §10.9, and count it in the Analysis Integrity block.
    - Flag n-gram repetition loops.
    - Flag segments with `compression_ratio > 2.4`.
 3. Word text is stored **twice**: `text` verbatim (for R4.6) and `norm` — lowercased,
@@ -775,6 +866,13 @@ Silence intervals, music/speech segmentation, tempo, key, energy, and sound even
 - Process in 60-second windows via `librosa.stream`. A full-file `chroma_cqt` +
   `tempogram` on a 90-minute track is multi-GB of intermediates and 5–15 minutes
   (§13.3).
+- **Sound-event classification (R5.2) has one sanctioned implementation:** YAMNet via
+  `tensorflow-macos` + `tensorflow-hub`, which do publish arm64 wheels. It is a heavy
+  dependency for one feature, so it is **optional**, installed via the
+  `videoanalyser[soundevents]` extra and enabled with `--sound-events`. When it is not
+  installed, tool-sound detection is skipped and the Analysis Integrity block records
+  `Sound events: not analysed (extra not installed)`. R5.2's tool *identity* still comes
+  from `C2` via transcript and vision; only the acoustic confirmation is lost.
 - **Do not use `essentia` or `panns-inference`.** `essentia-d` and `pann` are not real
   package names, `panns_inference.GooglePANNs` is not an API, and essentia has no macOS
   arm64 wheels — a hard install failure on the exact target machine.
@@ -830,8 +928,9 @@ The draft used a single `lead_lag_tolerance = 1.0 s` for two unrelated things. S
 
 - **Binding error** — the discrepancy between a word's time and the visual state it is
   bound to. Because states partition the timeline (§5.5) and both artifacts share one
-  clock (§5.3), this is **0 by construction**. Any non-zero value is a bug. Hard-fail
-  above 50 ms.
+  clock (§5.3), this is **0 by construction**. Assert exactly 0; the 50 ms figure
+  quoted elsewhere absorbs floating-point representation error in the comparison only,
+  and is not a tolerance for real misalignment.
 - **Behavioural lead/lag** — how far a spoken instruction precedes or follows the
   action it describes. This is a real, interesting human quantity (people say "click
   here" a beat before clicking). **Measure and report its distribution; never use it as
@@ -868,10 +967,14 @@ Something must produce *step ↔ screenshot*. Define it:
 2. **Clause → states:** the states overlapping `[clause_start − lead, clause_end + lag]`;
    the dominant state is the one with the greatest overlap duration. Ties break toward
    the state whose OCR text shares content words with the clause.
-3. **Steps:** a step is a contiguous clause run sharing an action verb and a target, or
-   an explicit enumeration in the narration ("first", "step two", "next").
-4. Emit a **step manifest** — this is the assembler's contract. Without it the Markdown
-   generator has no defined input for §10.4, which is exactly the gap the draft left.
+3. **Candidate steps:** a candidate is a contiguous clause run sharing an action verb
+   and a target, or an explicit enumeration in the narration ("first", "step two").
+4. Emit a **step manifest** of candidates — the assembler's contract, schema in §4.3.
+
+`S10` assigns every `step_id`. Persona `C1` may **merge, split, or label** candidates
+but may not mint an ID; a split inherits the parent ID with a suffix (`step_04a`). This
+is the single-owner rule of §9.11 made concrete — without it `S10` and `C1` would both
+be segmenting the video, which is the exact defect §9.11 exists to prevent.
 
 **Deictic words raise the visual-sync requirement, they do not lower it.** The draft
 listed `here`, `there`, `look`, `see`, `notice`, `now`, `next`, `then` as
@@ -1105,6 +1208,7 @@ JSON and never passes through a model (§9.3).
 ## Timeline               (templated)         R4.2
 ## Synchronized record    (templated)         R2.3  <- §10.3
 ## Steps                                      R4.8, R4.9, R4.10  <- §10.4
+## Explained topics       (conditional)       R4.8               <- §10.5
 ## Tools and materials                        R5.1, R5.2
 ## Timing and real-world durations            R5.3, R5.4, R5.5
 ## Applying this elsewhere                    R5.6
@@ -1112,6 +1216,20 @@ JSON and never passes through a model (§9.3).
 ## Music and sound            (if applicable) R4.11
 ## Full transcript        (templated)         R4.6  <- §10.9
 ```
+
+**"Conditional" is not a judgement call.** `G1` needs a computable predicate, so the
+required-section set is a table keyed on the §9.1 category enum:
+
+| Section | Required when |
+|---|---|
+| Meeting main points | `multi_speaker` **and** category ∈ {`video_conference`, `screen_share_tutorial`} |
+| Steps | a non-empty step manifest exists |
+| Explained topics | any contiguous span ≥ 60 s classified as explanation |
+| Look, style and mood | `category ∈ {music_inspiration, mixed}` **or** `has_music` |
+| Music and sound | `has_music` |
+| Tools and materials | `has_physical_tools` **or** any tool claim exists |
+
+Every other section is unconditionally required. `G1` reads this table.
 
 R4.4, R4.5 and R5.4 had **no owner at all** in the draft — no persona was tasked with
 writing a general description, a short summary, or a project-time estimate. They are
@@ -1176,7 +1294,7 @@ exactly what was asked for. Every step therefore carries **required key/value li
 - **Watch out for:** If a folder is selected first, this menu item reads
   "Folder upload" instead and uploads the whole directory.
 
-![The New dropdown open in Google Drive, with "File upload" highlighted in blue as the second item, above "Folder upload"](<../screenshots/...%2F03_click-file-upload.png>)
+![The New dropdown open in Google Drive, with "File upload" highlighted in blue as the second item, above "Folder upload"](<../screenshots/Upload%20a%20file%20to%20Drive%20%7C%2028.07.2026%20%7C%20original%3A%20youtube%20video/03_click-file-upload.png>)
 
 **What you see on screen:** The Drive interface with the left sidebar showing My Drive,
 Computers and Shared with me. The blue "New" button at the top left has been clicked and
@@ -1289,6 +1407,7 @@ and the template hardcoded `qa_passed: true`.
 | G11 | No sentinel tokens left in the document (`[CONFLICT]` unresolved, `{`…`}`, template placeholders) | blocking |
 | G12 | Folder name matches the R7 regex exactly | blocking |
 | G13 | Prose sections pass spell-check — **excluding** the transcript and every narrator quote | warning |
+| G14 | Every claim with `needs_visual` has a `visual_backup` that resolves to an exported screenshot | blocking |
 
 G6 must be measured against `ffprobe` and VAD output, not against the document's own
 front matter — the draft compared the transcript to a duration the same pipeline wrote,
@@ -1332,8 +1451,21 @@ fan-out and remediation rounds, **$235–400**. This section is why.
 (100, 50, 200–300, 1 fps, 6–10).
 
 ```
-vision_frames = min(len(representatives), ceil(duration_s / 15))   # cap 250
+vision_frames = min(len(representatives), vision_frame_cap)   # vision_frame_cap default 300
 ```
+
+**Every state is accounted for.** Because §5.5 caps state duration at 10 s,
+`len(representatives) ≥ duration / 10` on every file, so a duration-derived budget would
+always be smaller than the number of states — silently leaving states undescribed while
+`D3` asserts full coverage. Instead:
+
+- If `len(representatives) ≤ vision_frame_cap`, every state is described. This covers
+  any video up to ~50 minutes of continuously-changing content.
+- Above the cap, states are **merged** by descriptor similarity until the count fits,
+  and the merged state's span covers all of its members. No state is dropped; a merged
+  state records `merged_from: [ids]` and is rendered as one entry.
+- Coverage therefore remains 100% by construction, and `D3` checks it against the
+  merged state list, not the raw one.
 
 | Work | Model | Rationale |
 |---|---|---|
@@ -1341,10 +1473,17 @@ vision_frames = min(len(representatives), ceil(duration_s / 15))   # cap 250
 | Domain personas (`C*`) | `claude-sonnet-5` | $3/$15. Judgement without Opus cost. |
 | Audit + synthesis (`D*`, `E1`) — text only | `claude-opus-5` | $5/$25. Reasoning-heavy, no images, low volume. |
 
-**Downscale frames to ≤ 1024 px on the long edge before encoding.** A full-resolution
-frame costs up to ~4,784 input tokens; 1024 px costs ~786 — a **6× reduction** with no
-loss for scene description, because the text has already been read locally by OCR (§7.2)
-and is supplied as text. Sending 4K frames so a paid model can re-read text you already
+**Downscale frames to ≤ 1024 px on the long edge before encoding.** Image cost is
+capped per model tier, so the saving differs by route — state both rather than quoting
+one number:
+
+| Route | Per-image ceiling | At 1024 px | Saving |
+|---|---|---|---|
+| `claude-haiku-4-5` (B1, the bulk) | ~1,600 tok | ~786 tok | ~2× |
+| `claude-sonnet-5` / `claude-opus-5` | ~4,784 tok | ~786 tok | ~6× |
+
+Downscaling is safe because the on-screen text has already been read locally by OCR
+(§7.2) and is supplied to the model as text. Sending 4K frames so a paid model can re-read text you already
 extracted for free is the single largest avoidable line item.
 
 ### 13.2 Runtime
@@ -1360,9 +1499,13 @@ Honest targets on an M1 (not Pro/Max), measured per stage and recorded in the ru
 | API (batched) | 2–5 min | 20–50 min |
 | **Total (no diarization)** | **~6–12 min** | **~50–100 min** |
 
-`-hwaccel videotoolbox` on every decode is mandatory. Without it, software decode of a
-2-hour 4K file alone is hours — the draft's "under 30 minutes total" was arithmetically
-impossible while performing three separate full decodes.
+`-hwaccel videotoolbox` is **requested** on every decode, not assumed. The base M1's
+VideoToolbox decodes H.264 and HEVC only — it has no VP9 or AV1 hardware path, and
+ffmpeg silently falls back to software rather than erroring. Since R1.1 requires
+`.webm` support, probe the codec at `S1`, record `hwaccel_used: bool` in `probe.json`,
+and surface it in the Analysis Integrity block. **The table above applies to H.264/HEVC
+sources; software-decoded VP9/AV1 runs roughly 3–6× slower**, and §15.3's runtime
+criterion is scoped accordingly.
 
 ### 13.3 Memory
 
@@ -1375,20 +1518,32 @@ roughly 10.6 GB, a smaller pool than the draft assumed. Audio features stream in
 
 ### 13.4 API efficiency — three multipliers the draft left on the table
 
-1. **Prompt caching.** One `cache_control: {"type": "ephemeral", "ttl": "1h"}`
-   breakpoint at the end of the shared block (schema + grounding rules + transcript +
-   frame manifest). Use the **1-hour** TTL: a 90-minute pipeline will expire a 5-minute
-   cache between phases. Cache reads cost ~0.1×.
+1. **Prompt caching.** One `cache_control` breakpoint at the end of the shared block
+   (schema + grounding rules + transcript + frame manifest). Reads cost ~0.1×; **writes
+   cost 1.25× at the 5-minute TTL and 2× at the 1-hour TTL** — quote both, because the
+   write multiplier is what decides whether caching pays. Break-even is 2 requests at
+   5 min, 3 at 1 hour. Use the 1-hour TTL only for a phase whose fan-out will not
+   complete inside 5 minutes.
+   **Minimum cacheable prefix is model-dependent** — `claude-haiku-4-5` requires
+   **4096 tokens**, and Haiku carries the bulk B1 traffic. A shorter prefix silently
+   does not cache and reports `cache_creation_input_tokens: 0`. Do not declare a
+   breakpoint on a phase whose shared prefix is under that floor.
 2. **Prime before fan-out.** Concurrent requests sharing a prefix **all miss** — none
-   has written the cache yet. Issue one cheap priming request carrying the exact prefix,
-   await the response, *then* fan out. Ten parallel personas over a 20k-token prefix
-   otherwise bill 250k tokens instead of 43k.
+   has written the cache yet. Issue one cheap **synchronous, non-batch** priming request
+   carrying the exact prefix, await the response, *then* fan out. With a 20k-token
+   prefix and ten personas: naive 10 × 20k × 1.25 = 250k billed tokens, versus
+   20k × 1.25 + 9 × 20k × 0.1 = 43k. Priming cannot itself be part of a batch, because
+   a batch is submitted atomically.
 3. **Batch API.** This workload is entirely offline and non-interactive — the textbook
    fit. 50% off, up to 100k requests per batch, results retrievable for 29 days. Submit
    each phase as one batch. This also makes crash recovery free (§4.4).
+   **Caching and batching interact:** a batch is only guaranteed to finish within 24 h,
+   so a batch running longer than the cache TTL loses the cache mid-flight. Treat the
+   cache discount as best-effort on batched phases and do not build the budget on it.
 
-Verify caching is working by asserting `usage.cache_read_input_tokens > 0` after the
-first call of each phase; log it.
+Verify caching per phase: assert `cache_creation_input_tokens > 0` on the **priming**
+call, and `cache_read_input_tokens > 0` on the **first fanned-out** call. Asserting a
+read on the priming call is wrong — that call is the one doing the write.
 
 ### 13.5 Budget control
 
@@ -1469,9 +1624,97 @@ draft specified config in three files with two disjoint schemas and duplicate ke
 carrying different units — `scene_detection_threshold` was simultaneously 0.15 on a 0–1
 scale and 27 on a 0–100 scale.
 
-Precedence: CLI flag > config file > model default. Every threshold named in this plan
-appears here with its default. Any config key nothing reads must be deleted, not left
-as decoration.
+Precedence: CLI flag > config file > model default. Any config key nothing reads must be
+deleted, not left as decoration.
+
+**Every threshold named anywhere in this plan appears below with a literal default.**
+A named-but-unvalued threshold is an unimplementable spec — §5.5's two delta floors
+alone determine the state count, the screenshot count, and therefore the cost.
+
+```yaml
+workspace_root: "~/Desktop/Video Analysis"
+sanitize_colon: false            # false = obey R7 literally (see §3.3)
+default_source: null             # null = use the A1 provenance enum
+
+visual:
+  descriptor_size: 64            # NxN grayscale, values 0-255
+  block_grid: 4                  # 4x4 = 16 tiles for screen content
+  block_delta_floor: 6.0         # mean-abs-diff per tile, 0-255 scale; screen content
+  anchor_delta_floor: 12.0       # cumulative drift from the group anchor
+  phash_distance_floor: 8        # camera footage only; recalibrated per file
+  max_state_seconds: 10.0
+  change_floor_percentile: 95    # §8.4 calibration
+  change_floor_minimum: 4.0      # hard floor under the percentile
+
+audio:
+  asr_sample_rate: 16000
+  analysis_sample_rate: 48000
+  silence_margin_db: 10.0        # threshold = measured noise floor + this
+  min_silence_seconds: 0.4
+  forced_align_residual_max_ms: 150
+  voiced_fraction_floor: 0.30    # below this, flag hallucination_suspect
+
+alignment:
+  clause_silence_seconds: 0.4
+  lead_seconds: 0.5              # behavioural, reported not gated
+  lag_seconds: 1.5
+  binding_error_epsilon_ms: 50   # float error absorption only (§8.1)
+
+sync:
+  sc1_max_lag_ms: 50
+  sc1_peak_prominence_floor: 0.25   # below this, SC1 reports INCONCLUSIVE
+  sc2_min_coverage: 0.99
+  sc2_max_unexplained_gap_s: 2.0
+  sc6_resample_fraction: 0.05
+
+vision:
+  vision_frame_cap: 300
+  max_image_long_edge_px: 1024
+  screenshot_long_edge_px: 2560
+
+models:
+  describe: "claude-haiku-4-5"
+  domain:   "claude-sonnet-5"
+  synthesise: "claude-opus-5"
+
+budget:
+  max_usd: 5.00                  # global for the invocation, not per video
+  confirm_threshold_usd: 2.00
+  max_dropped_frame_fraction: 0.02
+
+qa:
+  max_repair_rounds: 2
+  min_words:                     # per-section floors for G1/G11
+    general_description: 60
+    short_summary: 25
+    key_points: 40
+    step_why: 15
+    screen_description: 40
+  min_alt_text_chars: 60
+
+cache:
+  root: "~/Library/Caches/VideoAnalyser"
+  max_gb: 20
+```
+
+### 14.4 Appendix A — the controlled action verbs
+
+Gate `G8` is blocking and asserts that every step's **Action** begins with a verb from
+this list. The list must therefore exist in the document, not merely be referred to.
+
+*Software / UI:* `click`, `double-click`, `right-click`, `press`, `type`, `paste`,
+`select`, `choose`, `drag`, `drop`, `scroll`, `hover`, `open`, `close`, `switch`,
+`navigate`, `upload`, `download`, `save`, `rename`, `delete`, `enable`, `disable`,
+`expand`, `collapse`, `search`, `filter`, `copy`, `confirm`, `cancel`.
+
+*Workshop / physical:* `measure`, `mark`, `cut`, `rip`, `crosscut`, `drill`, `sand`,
+`plane`, `joint`, `route`, `chisel`, `carve`, `clamp`, `glue`, `screw`, `nail`,
+`assemble`, `disassemble`, `stain`, `seal`, `paint`, `finish`, `polish`, `steam`,
+`bend`, `dry`, `cure`, `wipe`, `mix`, `heat`, `cool`, `align`, `level`, `test`.
+
+Extending the list is a config change (`qa.extra_action_verbs`), not a code change. A
+step whose action does not start with a listed verb fails `G8` — which is the mechanism
+that makes "then they configure the settings" unemittable.
 
 ---
 
@@ -1526,9 +1769,9 @@ The build is done when:
 | M2 | `S1`–`S4`: probe, dense scan, states | State list partitions the timeline on all fixtures |
 | M3 | `S5`–`S7`: transcript, alignment, audio features | Word timestamps verified; `SC4` passes |
 | M4 | `S8`, `S10`, `S11`: representatives, alignment, **sync proofs** | **`SC1`–`SC6` pass. Do not proceed until they do.** |
-| M5 | `S12`: personas, prompts, grounding, evidence resolution | Every prompt file exists; `G9` passes |
+| M5 | `S9a`, `S9b`, `S12`: personas, prompts, grounding, evidence resolution | Every prompt file exists; `G9` passes |
 | M6 | `S13`: assembly, screenshots, delivery modes | A real tutorial produces a usable document |
-| M7 | `S14`: gates + negative tests | Every gate proven to fire |
+| M7 | `S13b`, `S14`: output verification, gates + negative tests | Every gate proven to fire |
 | M8 | Cost/perf: batching, caching, budget, resume | 90-minute video within §13.2 and §13.5 |
 
 M4 is the gate. Everything after it is worthless if the timeline is wrong, and a wrong
@@ -1556,7 +1799,8 @@ document rather than an error.
 | R4.4 | General description | §10.1 (E1) |
 | R4.5 | Short summary | §10.1 (E1) |
 | R4.6 | Verbatim transcript | §9.3, §10.9, G6, G7, G13 |
-| R4.7–4.8 | Screenshots per step / explained topic | §10.4, §10.5, §10.6 |
+| R4.7 | Screenshot where a claim needs visual backup | `Claim.visual_backup` (§4.3), gate G14 |
+| R4.8 | Screenshot of every step / explained topic | §10.4, §10.5, §10.6 |
 | R4.9 | Full UI step detail | §10.4, G8 |
 | R4.10 | Tool, action, why, how | §10.4, §9.2 (C2, C3) |
 | R4.11 | Style, mood, filters, music | §9.2 (C6, C7), §6.6 |
@@ -1567,7 +1811,8 @@ document rather than an error.
 | R5.6 | Transferability | §9.2 (C5) |
 | R6 | `Video Analysis` + three folders | §3.1 |
 | R7 | Screenshot folder naming | §3.2, §3.3, §3.3a, G12 |
-| R8.1–8.3 | Maximum detail, lose nothing | §10.2, §13.7, SC2 |
+| R8.1–8.3 | Maximum detail, lose nothing, all perspectives | §9.2 roster, persona D3, §10.2, §13.7, SC2 |
 | R8.4 | No garbage, no broken links | G2, G3, G4, G11, D5 |
-| R9.4 | Executable with no prior context | This document; §9.9 |
+| R9.1–9.3 | Process requirements — composition, grilling, notification | Discharged by `docs/GRILL_LOG.md`; not build items |
+| R9.4 | Executable with no prior context | This document; §9.9; §14.3; §14.4 |
 
