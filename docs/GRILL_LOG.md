@@ -27,7 +27,8 @@ re-run a real `grillme` pass later against the same document.
 | 0 | Direct review of composed draft (dependency/API facts) | 12 | 12 | 0 | closed |
 | 1 | 5 independent lenses on the full draft set | 126 | 126 | 0 | closed |
 | 2 | 2 lenses on the finished `PLAN.md`, plus a scripted self-audit | 50 | 50 | 0 | closed |
-| 3 | Regression check on the patched plan | _in progress_ | | | |
+| 3 | Regression check on the patched plan | 10 | 10 | 0 | closed |
+| 4 | Convergence check | _in progress_ | | | |
 
 ---
 
@@ -276,3 +277,74 @@ distinct from `pkt_dts_time`; the colon really is legal on APFS and really rende
 50% off with 29-day retrieval; cache reads really are ~0.1× and writes 1.25×/2×;
 concurrent identical-prefix requests really do all miss; and 64×64 grayscale really is
 exactly 4096 bytes per frame.
+
+
+---
+
+## Round 3 — regression check on the patched plan
+
+Round 2 produced roughly thirty edits in one pass. Large patches are where new defects
+come from, so round 3 was scoped narrowly: **blocking findings only, capped at ten**,
+with an explicit instruction that an honest short list beats a padded one.
+
+It returned exactly ten, all real and all introduced or left open by the round-2 patch.
+The pattern is worth recording: every one is a *seam* — two sections that were each
+correct in isolation and disagreed with one another.
+
+1. **Two sections named different diarization pipelines** (§2.5 said `community-1`,
+   §6.5 still said `3.1`). Each is separately gated on Hugging Face, so the bootstrap
+   would have had the user accept one model and the pipeline would then load the other,
+   fail the gate, and take the documented degrade path to a single unnamed speaker —
+   losing R1.3.b speaker attribution with no diagnosis.
+
+2. **The state-merging rule I added in round 2 broke the invariant it was meant to
+   preserve.** It merged "by descriptor similarity", but similarity is not adjacency:
+   merging states 3 and 47 produces a span overlapping every state between them, so
+   `SC3`'s partition assertion fails on any video over the cap — which is every video
+   above ~50 minutes. Now restricted to temporally adjacent runs, with `S8` named as the
+   owner and an explicit statement of which stages read the raw list and which read the
+   merged one.
+
+3. **Gate `G6` would have quarantined every silent and music-only video** — two of the
+   five mandatory archetypes. A silent clip has no transcript span at all; a music-led
+   clip has near-zero speech *and* near-zero detected silence. `SC2` already had the
+   carve-out; `G6` did not.
+
+4. **The confirmation threshold was justified against the wrong number.** The text
+   argued it must clear the routine 90-minute cost, then set it to $5.00 — which clears
+   only the *batched* $4.41, while batching is opt-in, so the default path is $8.81.
+   Every 90-minute run would have blocked on exactly the prompt the paragraph existed to
+   prevent. Raised to $10.00.
+
+5. **The runtime table was labelled "API (batched)" while a later section asserted the
+   table assumes synchronous calls** — and the 12-minute acceptance criterion sits
+   directly on that row.
+
+6. **Enabling the documented `sanitize_colon` option guaranteed a blocking failure**,
+   because `G12`'s regex hard-required `original: `. A supported configuration would
+   have quarantined every run.
+
+7. **"Classified as explanation" gated a blocking check and was never defined** — no
+   owner, no signal, no threshold, no field to carry it.
+
+8. **Transition screenshots had nowhere to live.** `§10.6` mandated one per significant
+   state transition, but no section hosted them, so every one exported would have been a
+   blocking `G3` orphan.
+
+9. **`G8`'s required-field set ignored that software and physical steps have disjoint
+   mandatory fields** — a software step has no `tool`, a workshop step no `application`.
+   Read literally the gate failed every step; read loosely it enforced nothing.
+
+10. **The automatic diarization trigger read a persona output produced by a later
+    stage** — the same cycle class the round-2 stage split was supposed to eliminate.
+    Fixed by moving `S9a_FRAMING` ahead of the audio stages and stating that
+    `A2.multi_speaker` is inferred from probe and frame evidence, never from
+    `speakers.json`.
+
+The reviewer also independently re-verified the Anthropic API claims — model IDs,
+all three prices, the introductory Sonnet rate, the 4096-token Haiku cache minimum, the
+1.25×/2× write and 0.1× read multipliers, the 50% batch discount, 29-day retention, and
+the per-image token ceilings — and found no errors.
+
+**Trend:** 126 findings → 46 → 10. Each round's findings are narrower and more local
+than the last, which is what convergence looks like.
