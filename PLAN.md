@@ -299,6 +299,11 @@ implementer must handle deliberately rather than discover:
   ^(?P<title>.+) \| (?P<date>\d{2}\.\d{2}\.\d{4}) \| original: (?P<source>.+?)( \((?P<n>\d+)\))?$
   ```
 
+  With `sanitize_colon: true` the separator becomes ` - `, so `G12` must select its
+  pattern from the active setting — `original[:] ` when false, `original - ` when true.
+  A gate that hard-codes the colon would quarantine every run of a documented,
+  supported configuration.
+
 ### 3.3a Who computes the folder name, and from what
 
 The naming rule above is useless without a named owner. Stage `S9b_NAMING` (§4.2)
@@ -442,14 +447,14 @@ it mid-run.
 | ID | Stage | Consumes | Produces | Parallel with |
 |---|---|---|---|---|
 | `S1_PROBE` | Container/stream interrogation | video file | `probe.json` | — |
+| `S9a_FRAMING` | Personas A1, A2 — provenance and category. **Runs early**: `S6` needs `A2.multi_speaker` to decide whether to diarize (§6.5) | `probe.json`, a few frames | `personas/A*.json` | S2, S3 |
 | `S2_AUDIO_EXTRACT` | Extract ASR WAV (16 kHz mono) + analysis WAV (48 kHz stereo) | `probe.json` | `asr.wav`, `analysis.wav` | S3 |
 | `S3_VISUAL_SCAN` | **Single dense decode**: per-frame PTS + downscaled descriptor + activity envelope | `probe.json` | `frames.parquet`, `activity.npy` | S2 |
 | `S4_STATES` | Segment the visual track into half-open state intervals | `frames.parquet` | `visual_states.json` | — |
 | `S5_TRANSCRIBE` | ASR + forced alignment → word-level timestamps | `asr.wav` | `transcript.json` | — |
-| `S6_DIARIZE` | Speaker turns (optional, §6.5) | `asr.wav` | `speakers.json` | — |
+| `S6_DIARIZE` | Speaker turns (optional, §6.5) | `asr.wav`, `A2.multi_speaker` | `speakers.json` | — |
 | `S7_AUDIO_FEATURES` | Silence, music, tempo/key, sound events | `analysis.wav` | `audio_features.json` | — |
 | `S8_REPRESENTATIVES` | Choose representative frames; extract JPEGs; OCR them | `visual_states.json` | `representatives.json`, frame JPEGs | — |
-| `S9a_FRAMING` | Personas A1, A2 only — provenance and category | `probe.json`, few frames | `personas/A*.json` | — |
 | `S9b_NAMING` | Folder name (§3.3a) | `probe.json`, A1, A2 | `naming.json` | — |
 | `S10_ALIGN` | Bind words → states; clauses → states; steps → screenshots | S4, S5, S6, S8 | `alignment.json` | — |
 | `S11_VERIFY_SYNC` | The sync proofs of §5.6 — **gate** | S10 | `sync_report.json` | — |
@@ -877,9 +882,18 @@ Whisper's native word times come from cross-attention DTW and are routinely ±20
 
 ### 6.5 Diarization (`S6_DIARIZE`) — optional
 
-`pyannote/speaker-diarization-3.1`. Off by default, enabled with `--diarize` or
-automatically when the categoriser detects a multi-speaker archetype (R1.3.b). It is
-the single slowest local stage (§13.2) and adds nothing to a solo screen recording.
+`pyannote/speaker-diarization-community-1` — the default pipeline for the pinned
+`pyannote.audio` 4.0.7. (3.1 is the legacy pipeline; it is separately gated on Hugging
+Face, so naming one in the bootstrap and loading the other would fail on an unaccepted
+gate and silently degrade to a single speaker. §2.5 gates the same model named here.)
+
+Off by default. Enabled with `--diarize`, or automatically when `A2.multi_speaker` is
+set. **That auto-trigger is why `S9a_FRAMING` runs before the audio stages in §4.2** —
+`A2` must exist before `S6` decides whether to run. `A2.multi_speaker` is therefore
+inferred from probe and frame evidence (multiple video tiles, call-UI chrome, container
+metadata, two or more audio tracks), never from `speakers.json`, which does not exist
+yet. Diarization is the single slowest local stage (§13.2) and adds nothing to a solo
+screen recording.
 
 - **Word→turn assignment** is by maximum temporal overlap. On ties, or when overlap is
   < 60%, emit `speaker: "UNKNOWN"` rather than guessing. Words inside overlapped-speech
@@ -1254,6 +1268,7 @@ JSON and never passes through a model (§9.3).
 ## Synchronized record    (templated)         R2.3  <- §10.3
 ## Steps                                      R4.8, R4.9, R4.10  <- §10.4
 ## Explained topics       (conditional)       R4.8               <- §10.5
+## Visual walkthrough     (conditional)       R2.3, R4.7  <- §10.6
 ## Tools and materials                        R5.1, R5.2
 ## Timing and real-world durations            R5.3, R5.4, R5.5
 ## Applying this elsewhere                    R5.6
@@ -1269,7 +1284,8 @@ required-section set is a table keyed on the §9.1 category enum:
 |---|---|
 | Meeting main points | `multi_speaker` **and** category ∈ {`video_conference`, `screen_share_tutorial`} |
 | Steps | a non-empty step manifest exists |
-| Explained topics | any contiguous span ≥ 60 s classified as explanation |
+| Explained topics | `B2` emitted at least one `explanation_span` (§10.5) |
+| Visual walkthrough | any significant state transition falls outside every step — hosts those screenshots with their descriptions |
 | Look, style and mood | `category ∈ {music_inspiration, mixed}` **or** `has_music` |
 | Music and sound | `has_music` |
 | Tools and materials | `has_physical_tools` **or** any tool claim exists |
@@ -1356,22 +1372,59 @@ For physical/workshop content (R4.10) the field set is:
 - **Parameters:** each as `name: value` — grit, speed, angle, passes, depth, feed
 - **Why / Watch out for:** as above
 
-Gate `G8` (§12) asserts every step has each required field, non-empty, and that
-**Action** begins with a verb from a controlled list. A vague step cannot be emitted.
+Gate `G8` asserts every step has each required field, non-empty, and that **Action**
+begins with a verb from the controlled list in §14.4. A vague step cannot be emitted.
+
+**The required set depends on the content class**, because a software step legitimately
+has no `tool` and a workshop step has no `application` — the `Step` model (§4.3) marks
+both Optional for exactly that reason. `G8` reads this table:
+
+| Field | Software step (`has_screen_content`) | Physical step (`has_physical_tools`) |
+|---|---|---|
+| `span`, `action_verb`, `target`, `result`, `why` | required | required |
+| `screenshot_ids` (≥ 1) | required | required |
+| `application` | required | — |
+| `url` | required when the application is a website | — |
+| `tool` | — | required |
+| `consumable` | — | required when one is used |
+| `parameters` | — | required, ≥ 1 entry |
+| `watch_out` | optional | optional |
+
+A step in a video with both classes must satisfy whichever class its own evidence
+supports; if both, both. Read literally without this table, `G8` fails every step ever
+emitted; read loosely, it enforces nothing.
 
 ### 10.5 Explained topics (R4.8)
 
 R4.8 covers a two-minute explanation inside a seven-minute video that is not itself a
-tutorial. Whenever a contiguous span ≥ 60 s is classified as explanation, emit an
+tutorial. Whenever a contiguous span is **classified as explanation**, emit an
 **Explained topics** section using the same field set and the same ≥1-screenshot-per-step
 rule. Without this, a talking-head video with one explained concept falls through every
 section in the template.
 
-### 10.6 Screenshot density
+**"Classified as explanation" is a computable predicate, not a judgement call** — `G1`
+is blocking and depends on it. Persona `B2` owns the classification and emits
+`explanation_spans` into the alignment artifact. A span qualifies when all hold:
 
-**≥ 1 screenshot per step** (R4.8, R4.9) plus one per significant state transition.
-This is a floor, not a target. The draft suggested "6–10 screenshots for a 3–5 minute
-tutorial", which actively pushes a dense 14-step UI walkthrough to drop half its steps.
+- duration ≥ `explanation_min_seconds` (default 60);
+- speech density ≥ `explanation_speech_density` (default 0.6 — the fraction of the span
+  covered by word intervals), so a silent working shot does not qualify;
+- **no** step-manifest candidate (§8.3) overlaps it — an explained procedure is already
+  covered by §10.4, and this section exists for the non-procedural case.
+
+Both thresholds live in §14.3.
+
+### 10.6 Screenshot density, and the Visual walkthrough section
+
+**≥ 1 screenshot per step** (R4.8, R4.9), and ≥ 1 per explained-topic step. This is a
+floor, not a target. The draft suggested "6–10 screenshots for a 3–5 minute tutorial",
+which actively pushes a dense 14-step UI walkthrough to drop half its steps.
+
+**Screenshots at significant state transitions that fall outside any step** are exported
+only when §10.1's *Visual walkthrough* section is emitted, and they live there. Nothing
+may be exported without a section that references it: `G3` treats an unreferenced file
+as a blocking orphan, and `G5` requires alt text and a "What you see on screen" block
+for *every* image — so an exported frame with no home fails two gates.
 
 ### 10.7 Alt text carries the content
 
@@ -1444,19 +1497,25 @@ and the template hardcoded `qa_passed: true`.
 | G3 | Every exported screenshot is referenced ≥ 1 time (no orphans) | blocking |
 | G4 | No two screenshots are byte-identical; perceptual near-duplicates flagged | warning |
 | G5 | Every image has alt text ≥ 60 chars, non-generic, plus a "What you see on screen" block ≥ 40 words | blocking |
-| G6 | Transcript span vs `ffprobe` duration within 1.0 s, **and** transcribed + detected-silence ≥ 98% of duration | blocking |
+| G6 | *(only when `has_speech`)* transcript span vs `ffprobe` duration within 1.0 s, **and** `union(transcribed ∪ silence ∪ music ∪ non-speech)` ≥ 98% of the audio span | blocking |
 | G7 | Every narrator quote is a byte-exact substring of the transcript after whitespace normalisation | blocking |
-| G8 | Every step has all required fields, non-empty, `Action` starting with a controlled verb | blocking |
+| G8 | Every step has the required fields **for its content class** (table below), non-empty, `Action` starting with a controlled verb (§14.4) | blocking |
 | G9 | Every claim's evidence reference resolves (§9.8) | blocking |
 | G10 | Timestamps monotonic within each table; adjacent chapter rows share boundaries | blocking |
 | G11 | No sentinel tokens left in the document (`[CONFLICT]` unresolved, `{`…`}`, template placeholders) | blocking |
-| G12 | Folder name matches the R7 regex exactly | blocking |
+| G12 | Folder name matches the R7 regex for the active `sanitize_colon` setting | blocking |
 | G13 | Prose sections pass spell-check — **excluding** the transcript and every narrator quote | warning |
 | G14 | Every claim with `needs_visual` has a `visual_backup` that resolves to an exported screenshot | blocking |
 
 G6 must be measured against `ffprobe` and VAD output, not against the document's own
 front matter — the draft compared the transcript to a duration the same pipeline wrote,
 so a run that truncated both passed.
+
+**G6 does not apply to silent or music-only videos.** It mirrors `SC2`'s explained-
+coverage set exactly. Without that carve-out, an AI-generated silent clip (R1.3.d) has
+no transcript span at all and a music-led Instagram clip (R1.3.a) has near-zero speech
+*and* near-zero silence — both would quarantine, and the tool would never produce output
+for two of its five mandatory archetypes.
 
 G13 is scoped and non-blocking because a verbatim transcript of real speech is by
 definition full of spell-check hits; the draft's unscoped gate would either never pass
@@ -1506,11 +1565,16 @@ always be smaller than the number of states — silently leaving states undescri
 
 - If `len(representatives) ≤ vision_frame_cap`, every state is described. This covers
   any video up to ~50 minutes of continuously-changing content.
-- Above the cap, states are **merged** by descriptor similarity until the count fits,
-  and the merged state's span covers all of its members. No state is dropped; a merged
-  state records `merged_from: [ids]` and is rendered as one entry.
-- Coverage therefore remains 100% by construction, and `D3` checks it against the
-  merged state list, not the raw one.
+- Above the cap, **temporally adjacent runs** of similar states are merged until the
+  count fits. Merging is restricted to adjacent runs precisely so the result is still a
+  partition: merging states 3 and 47 by descriptor similarity alone would produce a span
+  overlapping everything between them and break `SC3`. Merge the adjacent pair with the
+  smallest descriptor distance, repeat until the count fits. A merged state records
+  `merged_from: [ids]` and is rendered as one entry; no state is dropped.
+- **Owner:** `S8_REPRESENTATIVES` performs the merge. `frames.parquet` keeps the raw
+  state list; `S10_ALIGN`, §10.3's table, and screenshot export all consume the
+  **merged** list, so there is exactly one notion of "a state" downstream.
+- Coverage therefore remains 100% by construction, and `D3` checks the merged list.
 
 | Work | Model | Rationale |
 |---|---|---|
@@ -1546,8 +1610,13 @@ Honest targets on an M1 (not Pro/Max), measured per stage and recorded in the ru
 | Transcribe + align | 1–2 min | 12–25 min |
 | Diarize (optional) | 2–6 min | 15–45 min |
 | OCR representatives | 20–60 s | 3–8 min |
-| API (batched) | 2–5 min | 20–50 min |
+| API (synchronous, the default) | 2–5 min | 20–50 min |
 | **Total (no diarization)** | **~6–12 min** | **~50–100 min** |
+
+The table assumes **synchronous** API calls (§13.4's default), H.264/HEVC input, and no
+diarization. With `--batch` the API row is unbounded in latency — usually under an hour,
+guaranteed only within 24 — which is why batching is opt-in and why §15.3's runtime
+criterion is scoped to the synchronous path.
 
 `-hwaccel videotoolbox` is **requested** on every decode, not assumed. The base M1's
 VideoToolbox decodes H.264 and HEVC only — it has no VP9 or AV1 hardware path, and
@@ -1621,9 +1690,11 @@ orders of magnitude, so it must state its own. At the prices in §13.1, a 300-fr
 So a routine 90-minute video is **$4–9**, not $118–197. Two consequences the numbers
 force: the frame cap bounds only the *image* line item (~$0.20 of the Haiku figure) —
 the money is in persona fan-out over the transcript and state descriptions, so that is
-where the budget lever belongs; and `confirm_threshold_usd` must not sit below the
-routine long-video cost or every 90-minute run blocks on a prompt. Hence the $5.00
-default in §14.3, not $2.00.
+where the budget lever belongs; and `confirm_threshold_usd` must clear the routine
+long-video cost **on the default path**, or every 90-minute run blocks on a prompt.
+Since §13.4 makes batching opt-in, the default 90-minute cost is the unbatched $8.81
+(and up to $8.91 with both repair rounds), not the batched $4.41 — so the threshold is
+**$10.00**, not $5.00 and certainly not $2.00.
 
 Sonnet 5 also carries an introductory $2/$10 per MTok through 2026-08-31, so estimates
 built on the $3/$15 list price are conservative until then.
@@ -1747,6 +1818,8 @@ audio:
 
 alignment:
   clause_silence_seconds: 0.4
+  explanation_min_seconds: 60.0
+  explanation_speech_density: 0.6
   lead_seconds: 0.5              # behavioural, reported not gated
   lag_seconds: 1.5
   binding_error_epsilon_ms: 50   # float error absorption only (§8.1)
@@ -1770,8 +1843,8 @@ models:
 
 budget:
   max_usd: 25.00                 # global for the invocation, not per video
-  confirm_threshold_usd: 5.00    # above the routine 90-min cost (§13.5), so long
-                                 # videos do not block on a prompt every run
+  confirm_threshold_usd: 10.00   # clears the unbatched 90-min worst case (§13.5),
+                                 # so routine long videos do not block on a prompt
   max_dropped_frame_fraction: 0.02
 
 qa:
@@ -1841,12 +1914,18 @@ The build is done when:
 
 1. Every fixture in §15.1 processes without error, or fails with a clear diagnosis.
 2. Every gate in §12.1 is proven to fire by a test in §15.2.
-3. `SC1`–`SC6` (§5.6) pass on all fixtures; the PCM `-itsoffset` fixture recovers
-   0.400 s exactly (see §5.3 on why the fixture must not use AAC).
+3. No `SC*` check reports FAIL on any fixture. `INCONCLUSIVE` is an accepted outcome
+   exactly where §5.6 defines it (SC1 on speechless or uncorrelated content; SC4/SC5
+   have no meaning without a transcript). The PCM `-itsoffset` fixture recovers 0.400 s
+   exactly (see §5.3 on why the fixture must not use AAC).
 4. The R7 folder name for a known input is byte-identical to the required format, and
    `os.listdir` returns it exactly.
 5. Every `![](...)` in every generated document resolves.
-6. A 7-minute tutorial completes in ≤ 12 minutes and under $1.00 with default settings.
+6. A 7-minute H.264/HEVC tutorial, without diarization, completes in ≤ 12 minutes
+   synchronously and under **$1.50** with default settings — the ceiling clears §13.5's
+   worst case of ~$1.20 with both repair rounds fired, since `max_repair_rounds: 2` *is*
+   the default. Software-decoded VP9/AV1 and `--diarize` runs are out of scope for this
+   criterion (§13.2).
 7. Every row of §17 is satisfied.
 8. **Structural determinism:** the same video processed twice yields the same section
    set, step count, screenshot count and timestamps (±1 frame). Prose will differ — that
