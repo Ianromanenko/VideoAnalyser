@@ -26,7 +26,8 @@ re-run a real `grillme` pass later against the same document.
 |------|--------|----------|-------|----------|--------|
 | 0 | Direct review of composed draft (dependency/API facts) | 12 | 12 | 0 | closed |
 | 1 | 5 independent lenses on the full draft set | 126 | 126 | 0 | closed |
-| 2 | 2 lenses on the finished `PLAN.md` | see below | | | |
+| 2 | 2 lenses on the finished `PLAN.md`, plus a scripted self-audit | 50 | 50 | 0 | closed |
+| 3 | Regression check on the patched plan | _in progress_ | | | |
 
 ---
 
@@ -182,3 +183,96 @@ Ordered by how badly they would have hurt, not by which section they came from.
 - **"Drop the colon from the R7 folder name."** Rejected — R7 is a literal, [HARD]
   requirement and the user supplied the exact string. The Finder rendering is documented
   and a config switch is offered, but the default obeys the spec.
+
+---
+
+## Round 2 — grilling the finished plan
+
+Two lenses, this time reading `PLAN.md` rather than the drafts: one requirements and
+executability audit, one technical fact-check with shell and network access that
+verified claims by measurement rather than by reading.
+
+**46 findings.** A self-audit of internal cross-references, run in parallel, found four
+more that I had introduced while writing.
+
+### From the plan audit (16)
+
+The three that would have broken the build outright:
+
+1. **The dense-scan command could not produce timestamps at all.** It piped
+   `-f rawvideo` to PyAV. rawvideo is a headerless byte stream — no container, no
+   `time_base`, no PTS. The fact-checker measured it: a 5-second, 30 fps source came
+   back described as 25 fps and 6 seconds, with fabricated uniformly-spaced timestamps.
+   That is the *same* silent whole-file corruption the section was written to prevent,
+   and it would have passed the monotonicity and partition checks because a fabricated
+   series is perfectly self-consistent. Replaced with in-process PyAV decoding.
+
+2. **The stage table contained a real dependency cycle** — `S9_NAMING` consumed personas
+   A1/A2, while the persona stage consumed "everything above", including `S9`. The same
+   defect class the plan congratulates itself for removing elsewhere. Split into
+   `S9a_FRAMING` → `S9b_NAMING` → `S12_PERSONAS` → `S13` → `S13b_VERIFY_OUT`.
+
+3. **The frame budget was arithmetically incapable of its own job.** States are capped
+   at 10 s, so a timeline always holds ≥ `duration/10` states; the budget granted
+   `duration/15` frames — strictly fewer, for every video length. A 90-minute video
+   could never describe more than 46% of its states while the integrity block asserted
+   "0 unanalysed". Replaced with a cap plus explicit state *merging*, so coverage stays
+   100% by construction.
+
+Also: the plan promised "every threshold named in this plan appears here with its
+default" and then omitted the two delta floors that govern state segmentation — and the
+controlled verb list that blocking gate `G8` depends on. Both are now written out
+(§14.3, §14.4). Cache guidance quoted only the read discount while mandating the TTL
+with the *higher write* multiplier, and asserted the wrong `usage` field (the priming
+call writes the cache; asserting a read on it fails on every correct run).
+
+### From the technical fact-check (30)
+
+This pass ran commands rather than trusting recall, and overturned several claims I had
+stated confidently:
+
+| Claim in the plan | Measured reality |
+|---|---|
+| "Modern ffmpeg auto-applies the display matrix" → rotation needs no handling | True for the ffmpeg **CLI**, **false for PyAV**. Since the dense scan is PyAV and export is the CLI, rotated iPhone video would produce a descriptor series transposed relative to the screenshots — on two of the five mandatory archetypes, failing `SC6` with no diagnosis. |
+| "macOS normalises filenames toward NFD" | **APFS preserves** normalisation and is normalisation-*insensitive*; NFC and NFD spellings collide as the same directory. HFS+ forced NFD. The duplicate-folder failure described was impossible. |
+| "The macOS Desktop is iCloud-synced by default" | Opt-in, not default. The conclusion (keep the cache in `~/Library/Caches`) survives; the stated reason did not. |
+| "APFS limits a component to 255 **bytes**" | 255 UTF-8 **characters** in practice. Truncating by bytes cuts non-ASCII titles up to 4× early. |
+| "ffprobe emits `N/A` for `start_time`, `duration`, `nb_frames`" | With the JSON writer the plan mandates, those keys are **omitted**; `N/A` appears only in the flat writer. `start_time` is present and numeric. The error to absorb is `KeyError`, not `ValueError`. |
+| "`librosa.beat.tempo` removed in ≥0.10.1" | Still present in the pinned 0.11.0, emitting a `FutureWarning`; moved in 0.10.0, removal slated for 1.0. |
+| "whisper large-v3 ≈ 1.5 GB" | ~3.1 GB at fp16 — 1,550 M parameters. The disk pre-check would have under-reserved by 2×. |
+| Cross-check scene boundaries with `scenedetect` over the descriptor series | `ContentDetector` calls `cvtColor(BGR2HSV)` and requires 3-channel input; it raises on a grayscale descriptor. Not implementable without a second decode. |
+| "`-itsoffset 0.4` … the pipeline must report 0.4 s" | With AAC the offset snaps to the 1024-sample packet grid and lands at **0.376 s**. The mandatory test would fail by 24 ms through no fault of the pipeline. Fixture must use PCM. |
+| `pyannote/speaker-diarization-3.1` | Legacy for the pinned 4.0.7, whose default is `speaker-diarization-community-1` — specifically better at speaker counting, the exact failure mode §6.5 guards. |
+| "Accept Python 3.11–3.13" | `rapidocr-onnxruntime` caps at `<3.13`; the interpreter check would pass and `pip install` would then fail. |
+| "retry 429/529 only; never retry 4xx" | 429 **is** 4xx. Self-contradictory as written. |
+| "~4,784 tokens per image → 6× saving" | That ceiling belongs to the high-resolution tier. `claude-haiku-4-5` — which carries the bulk of the frames — caps near 1,600, so the real saving on the dominant route is ~2×. |
+
+Two further structural points worth recording: batching was mandated while the
+acceptance criteria demanded a 12-minute wall clock, but batch turnaround is only
+*guaranteed* within 24 hours — batching is now opt-in. And §13 spent its length
+refuting a wrong cost figure without ever stating a corrected one; it now gives the
+worked number (**~$4–9 for a 90-minute video**, against the draft's $118–197) and the
+confirmation threshold was raised so routine long videos do not block on a prompt.
+
+### From my own cross-reference audit (4)
+
+Found by scripting the document rather than reading it:
+
+- **Identifier collision:** the sync checks were `C1`–`C6` and the domain personas were
+  `C1`–`C9`. "C1–C6 pass" in the acceptance criteria and milestones was ambiguous.
+  Renamed the sync checks `SC1`–`SC6`.
+- Two `§n.n` cross-references pointed at sections that do not exist.
+- One sentence implied a persona in the roster that is not in it.
+
+### Confirmed correct
+
+Worth recording, because a review that only reports errors gives no signal about what
+was checked: every package and version in §2.4 exists as pinned; `mlx-whisper` really is
+Metal-backed and `faster-whisper`/CTranslate2 really is CPU-only on Apple Silicon;
+`ocrmac` really wraps Apple's Vision framework; `word.probability` is the correct
+attribute; the `rotate` filter really takes radians; `best_effort_timestamp` really is
+distinct from `pkt_dts_time`; the colon really is legal on APFS and really renders as
+`/` in Finder; the three model IDs and all three prices are current; the Batch API is
+50% off with 29-day retrieval; cache reads really are ~0.1× and writes 1.25×/2×;
+concurrent identical-prefix requests really do all miss; and 64×64 grayscale really is
+exactly 4096 bytes per frame.
