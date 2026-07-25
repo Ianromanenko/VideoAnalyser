@@ -30,7 +30,8 @@ re-run a real `grillme` pass later against the same document.
 | 3 | Regression check on the patched plan | 10 | 10 | 0 | closed |
 | 4 | Convergence check | 7 | 7 | 0 | closed |
 | 5 | Convergence re-check | 5 | 5 | 0 | closed |
-| 6 | Convergence re-check | _in progress_ | | | |
+| 6 | Convergence re-check | 3 | 3 | 0 | closed |
+| 7 | Convergence re-check | _in progress_ | | | |
 
 ---
 
@@ -470,3 +471,45 @@ The five that did not:
    rather than framing frames and therefore unable to catch it.
 
 **Trend:** 126 → 46 → 10 → 7 → 5.
+
+
+---
+
+## Round 6 — convergence re-check
+
+Three blocking findings, verdict **NOT CONVERGED**. The reviewer cleared the S3/S4
+fusion, the descriptor story, `G6`'s rewrite and `G14`'s validation point — and
+explicitly listed four things it had decided *not* to report as non-blocking, with
+reasons. That restraint is what makes the three it did report worth acting on.
+
+1. **The screen-vs-camera content class had no producer `S3` could read.** §5.5 said the
+   descriptor choice is "decided at probe time", but nothing in §5.2 computed it, and
+   the plan's only screen-vs-camera signal — `A2.has_screen_content` — comes from `S9a`,
+   which the stage table declares *parallel* with `S3`. The round-5 fusion closed the
+   last stage where segmentation could have picked it up later. This is the label that
+   selects between per-tile MAD and pHash, and §5.5 states the consequence of choosing
+   wrong in its own words: on a UI, pHash deduplicates the change away and "directly
+   defeats R4.9". `S1` now computes `content_class` from the framing frames, with an
+   explicit asymmetry — `mixed` takes the screen branch, because guessing camera on
+   screen content is unrecoverable while the reverse only over-segments, which the
+   anchor rule already bounds. R1.3.b, a call with camera tiles *and* a shared screen,
+   is exactly the `mixed` case.
+
+2. **The rotation rule claimed to be exhaustive and missed a fourth decode site.** `SC6`
+   re-extracts frames inside `S11`, and its decoder was unspecified — the natural
+   implementation reuses `S3`'s PyAV helper, where "apply nothing" is the wrong rule.
+   `SC6` is the very check §5.2 nominates as the one that would catch an orientation
+   mismatch, so getting it wrong would hard-fail every rotated capture at `M4`, a gate
+   the build is told not to proceed past, while pointing the engineer at the wrong
+   culprit.
+
+3. **`Claim.backing_state` was written and never read.** §10.6 instead invoked "the
+   claim's dominant visual state (§8.2)" — but §8.2 defines containment binding for
+   *words*, and "dominant state" is defined in §8.3 for *clauses*. Neither is defined for
+   a claim. So the rule that must produce a screenshot for every `needs_visual` claim
+   dereferenced an undefined quantity while the field built for it sat dead, and three
+   plausible implementations would disagree about which moment backs the claim — a
+   silent R4.7 defect that `G14` cannot catch, because `G14` only checks that *some*
+   export resolves.
+
+**Trend:** 126 → 46 → 10 → 7 → 5 → 3.

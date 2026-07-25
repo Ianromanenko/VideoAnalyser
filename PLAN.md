@@ -652,8 +652,13 @@ Robustness rules, each of which fixes a crash the draft would have hit:
   before computing the descriptor. In `S1` (framing frames) and `S8` (representative
   export), both of which go through the ffmpeg CLI, **apply nothing** — the CLI has
   already done it, and applying it again rotates twice.
-  Every decode site in the pipeline appears in that list; adding a new one without
-  adding it here is a defect. The framing frames matter disproportionately because they
+  In `S11`, `SC6`'s re-extraction MUST reuse `S8`'s ffmpeg-CLI path and likewise apply
+  nothing. That site is easy to miss and expensive to get wrong: the natural
+  implementation reuses `S3`'s PyAV descriptor helper, where "apply nothing" is the
+  wrong rule — `SC6` would then hard-fail on every rotated capture, and `M4` is a gate
+  the build is told not to proceed past.
+  `S1`, `S3`, `S8`, `S11`/`SC6` are every decode site in the pipeline; adding a new one
+  without adding it here is a defect. The framing frames matter disproportionately because they
   are the *only* frames `A1` and `A2` ever see, and `SC6` samples representatives rather
   than framing frames, so a double rotation there would silently degrade provenance,
   category and the R7 folder name with nothing to catch it. Assert that each framing
@@ -665,6 +670,21 @@ Robustness rules, each of which fixes a crash the draft would have hit:
 - **HDR / 10-bit:** if `color_transfer` is `smpte2084` or `arib-std-b67`, insert a
   tonemap filter before RGB conversion, or 4K HDR screen recordings produce washed-out
   screenshots.
+- **Content class.** `S1` writes `content_class: screen | camera | mixed` into
+  `probe.json`, computed from the five framing frames it already extracts. `S3` reads it
+  to choose its descriptor (§5.5), and `S3` runs parallel with `S9a`, so it **cannot**
+  use `A2.has_screen_content` — the only other screen-vs-camera signal in the plan.
+  Without this field the choice is a judgement call at the one place the plan can least
+  afford one.
+  Rule, thresholds in §14.3: compute mean edge density (Sobel magnitude over a threshold)
+  and palette flatness (fraction of pixels in the top 16 quantised colours) per framing
+  frame. `screen` when edge density ≥ `screen_edge_density_floor` **and** flatness ≥
+  `screen_flatness_floor`; `camera` when both are below; `mixed` otherwise.
+  **`mixed` takes the per-tile-MAD branch.** The asymmetry is deliberate: choosing pHash
+  on screen content silently deletes UI changes and defeats R4.9 unrecoverably, whereas
+  choosing tile-MAD on camera footage merely over-segments, which the anchor rule and
+  `max_state_seconds` already bound. R1.3.b — a video call with camera tiles *and* a
+  shared screen — is exactly the `mixed` case.
 - **VFR detection:** do not compare `r_frame_rate` to `avg_frame_rate` as strings —
   `"30000/1001"` vs `"29.97"` flags every ordinary 29.97 fps CFR file as variable.
   Parse both as `Fraction` and compare with tolerance; then confirm from `S3`'s real
@@ -754,7 +774,8 @@ alignment bugs — see §8.2.
 
 Segmentation from the dense descriptor series:
 
-- **Descriptor choice depends on content class**, decided at probe time:
+- **Descriptor choice depends on `probe.content_class`** (§5.2), which `S1` computes;
+  `mixed` uses the screen branch:
   - *Screen content* — tile the 64×64 descriptor into 16 blocks and declare a boundary
     when any single block's mean-absolute-difference exceeds `block_delta_floor`.
     Perceptual hashing is the **wrong** tool here: pHash keeps low-frequency DCT
@@ -1256,6 +1277,12 @@ overwrite a stated value; both are rendered side by side:
 - Claim schemas MUST accept the fields personas actually emit — the draft set
   `additionalProperties: false` while its own canonical example carried an extra field,
   so the example failed the schema.
+- `needs_visual` implies `backing_state is not None`, enforced in the same Pydantic
+  validation. Unlike `visual_backup` — which cannot exist until `S13` has frozen the
+  export set — `backing_state` is a state index the persona already has, so requiring it
+  at emission time is satisfiable and does not reintroduce the drop-every-style-claim
+  failure the `Claim` model's comment guards against. Without this rule the export
+  mechanism dereferences a null and `G14` passes vacuously.
 - Bounded remediation: at most **2** retries targeting only the failing claims. On
   exhaustion the claim is dropped and recorded in the coverage report, never silently
   kept.
@@ -1518,8 +1545,8 @@ when §10.1's *Visual walkthrough* section is emitted, and they live there.
 
 **A claim that needs visual backing also forces an export.** `G14` is blocking and
 requires every `needs_visual` claim to resolve to an *exported* screenshot — so a rule
-must exist that produces one. It does: such a claim's dominant visual state (§8.2) is
-added to the export set, and emitting one forces the *Visual walkthrough* section on
+must exist that produces one. It does: the state named by that claim's `backing_state`
+field (§4.3) is added to the export set, and emitting one forces the *Visual walkthrough* section on
 even when no transition otherwise qualified. Without this, a talking-head or
 music-inspiration video with no step manifest has style claims that are `needs_visual`
 by definition and nothing to point at — `G14` blocks, the repair rounds cannot mint a
@@ -1911,6 +1938,8 @@ sanitize_colon: false            # false = obey R7 literally (see §3.3)
 default_source: null             # null = use the A1 provenance enum
 
 visual:
+  screen_edge_density_floor: 0.08   # Sobel-magnitude fraction; content_class (§5.2)
+  screen_flatness_floor: 0.55       # fraction of pixels in top-16 quantised colours
   descriptor_size: 64            # NxN grayscale, values 0-255
   block_grid: 4                  # 4x4 = 16 tiles for screen content
   block_delta_floor: 6.0         # mean-abs-diff per tile, 0-255 scale; screen content
